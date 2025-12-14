@@ -51,6 +51,29 @@ function VoiceSelectionModal({ isOpen, onClose, onSelect, currentSettings }) {
   const [searchQuery, setSearchQuery] = useState('');
   const [playingVoiceId, setPlayingVoiceId] = useState(null);
   const [previewAudio, setPreviewAudio] = useState(null);
+  const [currentAudioUrl, setCurrentAudioUrl] = useState(null); // Track blob URL for cleanup
+
+  // Function to stop and cleanup current audio
+  const stopCurrentAudio = () => {
+    if (previewAudio) {
+      previewAudio.pause();
+      previewAudio.currentTime = 0;
+      // Remove all event listeners to prevent any callbacks
+      previewAudio.onended = null;
+      previewAudio.onerror = null;
+      previewAudio.oncanplaythrough = null;
+      previewAudio.onloadstart = null;
+      previewAudio.onloadeddata = null;
+    }
+    
+    // Clean up blob URL
+    if (currentAudioUrl && currentAudioUrl.startsWith('blob:')) {
+      URL.revokeObjectURL(currentAudioUrl);
+    }
+    
+    setPreviewAudio(null);
+    setCurrentAudioUrl(null);
+  };
 
   useEffect(() => {
     if (isOpen) {
@@ -59,11 +82,7 @@ function VoiceSelectionModal({ isOpen, onClose, onSelect, currentSettings }) {
     
     // Cleanup: stop audio when modal closes
     return () => {
-      if (previewAudio) {
-        previewAudio.pause();
-        previewAudio.currentTime = 0;
-        setPreviewAudio(null);
-      }
+      stopCurrentAudio();
       setPlayingVoiceId(null);
     };
   }, [isOpen]);
@@ -142,18 +161,15 @@ function VoiceSelectionModal({ isOpen, onClose, onSelect, currentSettings }) {
     const voiceId = voice.id || voice.voiceId;
     const voiceName = voice.name;
     
-    // Stop any currently playing audio
-    if (previewAudio) {
-      previewAudio.pause();
-      previewAudio.currentTime = 0;
-      setPreviewAudio(null);
-    }
-    
     // If clicking the same voice that's playing, just stop it
     if (playingVoiceId === voiceId) {
+      stopCurrentAudio();
       setPlayingVoiceId(null);
       return;
     }
+    
+    // Stop any currently playing audio before starting new one
+    stopCurrentAudio();
     
     setPlayingVoiceId(voiceId);
     
@@ -171,6 +187,9 @@ function VoiceSelectionModal({ isOpen, onClose, onSelect, currentSettings }) {
       // The response is the audio file itself
       const audioBlob = new Blob([response.data], { type: 'audio/mpeg' });
       const audioUrl = URL.createObjectURL(audioBlob);
+      
+      // Store the blob URL for cleanup
+      setCurrentAudioUrl(audioUrl);
 
       console.log('🔊 Playing preview audio from blob URL');
 
@@ -180,20 +199,13 @@ function VoiceSelectionModal({ isOpen, onClose, onSelect, currentSettings }) {
       audio.onended = () => {
         console.log('✅ Preview finished');
         setPlayingVoiceId(null);
-        setPreviewAudio(null);
-        // Clean up blob URL
-        if (audioUrl && audioUrl.startsWith('blob:')) {
-          URL.revokeObjectURL(audioUrl);
-        }
+        stopCurrentAudio();
       };
       
       audio.onerror = (error) => {
         console.error('❌ Error playing preview audio:', error);
         setPlayingVoiceId(null);
-        setPreviewAudio(null);
-        if (audioUrl && audioUrl.startsWith('blob:')) {
-          URL.revokeObjectURL(audioUrl);
-        }
+        stopCurrentAudio();
         alert('Failed to play voice preview. Please try again.');
       };
       
@@ -205,7 +217,7 @@ function VoiceSelectionModal({ isOpen, onClose, onSelect, currentSettings }) {
         } catch (playError) {
           console.error('❌ Error starting playback:', playError);
           setPlayingVoiceId(null);
-          setPreviewAudio(null);
+          stopCurrentAudio();
           alert('Failed to start playback. Please check browser console.');
         }
       };
