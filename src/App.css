@@ -6,8 +6,16 @@
 }
 
 /* Adjust main content when sidebar is present */
-.app > :not(.sidebar) {
+/* Exclude auth pages (login/register) from the margin */
+.app > :not(.sidebar):not(.auth-container) {
   margin-left: 240px;
   flex: 1;
   overflow-y: auto;
+}
+
+/* Auth pages should take full width */
+.app > .auth-container {
+  margin-left: 0;
+  width: 100%;
+  flex: 1;
 }
