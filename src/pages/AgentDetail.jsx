@@ -52,8 +52,10 @@ function AgentDetail() {
   const [expandedSettings, setExpandedSettings] = useState({
     knowledgeBase: true,
     speechSettings: false,
-    callSettings: false
+    callSettings: false,
+    functions: false
   });
+  const [functions, setFunctions] = useState([]);
   const [speechSettings, setSpeechSettings] = useState({
     voiceId: '21m00Tcm4TlvDq8ikWAM',
     voiceName: '',
@@ -122,6 +124,29 @@ function AgentDetail() {
       if (response.data.callSettings) {
         setCallSettings(response.data.callSettings);
       }
+      if (response.data.functions && response.data.functions.length > 0) {
+        console.log('📋 Loaded functions from agent:', response.data.functions);
+        setFunctions(response.data.functions);
+      } else {
+        // Initialize with default end_call function if none exist
+        console.log('📋 No functions found, initializing default end_call function');
+        const defaultFunction = [{
+          name: 'end_call',
+          description: 'End the call when user says goodbye, bye, or similar phrases',
+          enabled: true,
+          triggers: ['bye', 'goodbye', 'see you', 'talk later', 'end call', 'hang up'],
+          config: {}
+        }];
+        setFunctions(defaultFunction);
+        // Save the default function to the agent
+        try {
+          await axios.put(`${API_BASE_URL}/agents/${id}`, {
+            functions: defaultFunction
+          });
+        } catch (error) {
+          console.error('Error saving default function:', error);
+        }
+      }
     } catch (error) {
       console.error('Error fetching agent:', error);
       navigate('/');
@@ -155,7 +180,8 @@ function AgentDetail() {
         systemPrompt: systemPrompt,
         knowledgeBaseId: selectedKB || null,
         speechSettings: speechSettings,
-        callSettings: callSettings
+        callSettings: callSettings,
+        functions: functions
       });
       
       console.log('✅ Agent saved successfully. Response:', {
@@ -248,6 +274,13 @@ function AgentDetail() {
 
       const aiResponse = response.data.text;
       const audioUrl = response.data.audioUrl;
+      const shouldEndCall = response.data.shouldEndCall || false;
+
+      console.log('📥 Response received:', { 
+        hasText: !!aiResponse, 
+        hasAudio: !!audioUrl, 
+        shouldEndCall 
+      });
 
       // Always show the response - the interruption flag was just for tracking
       // Reset the interruption flag after we get the response
@@ -256,6 +289,25 @@ function AgentDetail() {
 
       // Show full response immediately
       setMessages(prev => [...prev, { role: 'assistant', content: aiResponse }]);
+      
+      // If end_call function was triggered, stop the conversation (exactly like pressing Stop button)
+      if (shouldEndCall) {
+        console.log('🔚 End call function triggered, stopping conversation immediately');
+        // Stop all audio first
+        if (audioRef.current) {
+          audioRef.current.pause();
+          audioRef.current = null;
+        }
+        if (cuttingAudioRef.current) {
+          cuttingAudioRef.current.pause();
+          cuttingAudioRef.current = null;
+        }
+        // Call stopConversation which does everything the Stop button does
+        // This will stop recognition, clear state, and end the call
+        await stopConversation();
+        // Don't continue with audio playback - conversation is ended
+        return;
+      }
 
       // Play audio response - but keep listening while playing
       // Ensure only one audio plays at a time - stop any existing audio first
@@ -950,64 +1002,7 @@ function AgentDetail() {
               </div>
               {expandedSettings.speechSettings && (
                 <div className="setting-content">
-                  <div className="speech-setting-group">
-                    <label>LLM Model</label>
-                    <div className="model-selector">
-                      <select
-                        value={speechSettings.openaiModel || 'gpt-4'}
-                        onChange={(e) => setSpeechSettings({ ...speechSettings, openaiModel: e.target.value })}
-                        className="model-select"
-                      >
-                        {OPENAI_MODELS.map(model => (
-                          <option key={model.id} value={model.id}>{model.name}</option>
-                        ))}
-                      </select>
-                      <button className="btn-icon" title="LLM Settings">
-                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                          <circle cx="12" cy="12" r="3"></circle>
-                          <path d="M12 1v6m0 6v6M5.64 5.64l4.24 4.24m4.24 4.24l4.24 4.24M1 12h6m6 0h6M5.64 18.36l4.24-4.24m4.24-4.24l4.24-4.24"></path>
-                        </svg>
-                      </button>
-                    </div>
-                  </div>
-
-                  <div className="speech-setting-group">
-                    <label>Voice</label>
-                    <div className="voice-selector">
-                      <button 
-                        className="voice-select-btn"
-                        onClick={() => setShowVoiceModal(true)}
-                      >
-                        {speechSettings.voiceName || 'Select Voice'}
-                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                          <polyline points="6 9 12 15 18 9"></polyline>
-                        </svg>
-                      </button>
-                      <button className="btn-icon" title="Voice Settings">
-                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                          <circle cx="12" cy="12" r="3"></circle>
-                          <path d="M12 1v6m0 6v6M5.64 5.64l4.24 4.24m4.24 4.24l4.24 4.24M1 12h6m6 0h6M5.64 18.36l4.24-4.24m4.24-4.24l4.24-4.24"></path>
-                        </svg>
-                      </button>
-                    </div>
-                    {speechSettings.voiceId && (
-                      <p className="voice-info-text">Voice ID: {speechSettings.voiceId}</p>
-                    )}
-                  </div>
-
-                  <div className="speech-setting-group">
-                    <label>Language</label>
-                    <select
-                      value={speechSettings.language || 'en'}
-                      onChange={(e) => setSpeechSettings({ ...speechSettings, language: e.target.value })}
-                      className="language-select"
-                    >
-                      {LANGUAGES.map(lang => (
-                        <option key={lang.code} value={lang.code}>{lang.name}</option>
-                      ))}
-                    </select>
-                  </div>
-
+                  {/* Removed LLM Model, Voice, and Language - they're already at the top */}
                   <div className="speech-setting-group">
                     <label>ElevenLabs Model</label>
                     <select
@@ -1085,6 +1080,103 @@ function AgentDetail() {
                       When enabled, the AI will greet the user first when the conversation starts.
                     </p>
                   </div>
+                </div>
+              )}
+            </div>
+
+            <div className="setting-item">
+              <div 
+                className="setting-header"
+                onClick={() => setExpandedSettings({ ...expandedSettings, functions: !expandedSettings.functions })}
+                style={{ cursor: 'pointer' }}
+              >
+                <span>
+                  Functions
+                </span>
+                <svg 
+                  width="16" 
+                  height="16" 
+                  viewBox="0 0 24 24" 
+                  fill="none" 
+                  stroke="currentColor" 
+                  strokeWidth="2"
+                  style={{ transform: expandedSettings.functions ? 'rotate(180deg)' : 'rotate(0deg)', transition: 'transform 0.2s' }}
+                >
+                  <polyline points="6 9 12 15 18 9"></polyline>
+                </svg>
+              </div>
+              {expandedSettings.functions && (
+                <div className="setting-content">
+                  <p style={{ fontSize: '0.75rem', color: '#6b7280', marginBottom: '1rem' }}>
+                    Enable your agent with capabilities such as calendar bookings, call termination, etc.
+                  </p>
+                  
+                  {functions.map((func, index) => (
+                    <div key={index} className="function-item" style={{ 
+                      display: 'flex', 
+                      alignItems: 'center', 
+                      justifyContent: 'space-between',
+                      padding: '0.75rem',
+                      background: '#f9fafb',
+                      borderRadius: '0.5rem',
+                      marginBottom: '0.5rem'
+                    }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                          <path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7A2 2 0 0 1 22 16.92z"></path>
+                        </svg>
+                        <span style={{ fontWeight: 500 }}>{func.name}</span>
+                      </div>
+                      <div style={{ display: 'flex', gap: '0.5rem' }}>
+                        <button
+                          className="btn-icon"
+                          onClick={() => {
+                            const newFunctions = [...functions];
+                            newFunctions[index] = { ...newFunctions[index], enabled: !newFunctions[index].enabled };
+                            setFunctions(newFunctions);
+                          }}
+                          title={func.enabled ? 'Disable' : 'Enable'}
+                        >
+                          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                            {func.enabled ? (
+                              <path d="M5 13l4 4L19 7"></path>
+                            ) : (
+                              <line x1="18" y1="6" x2="6" y2="18"></line>
+                            )}
+                          </svg>
+                        </button>
+                        <button
+                          className="btn-icon"
+                          onClick={() => {
+                            const newFunctions = functions.filter((_, i) => i !== index);
+                            setFunctions(newFunctions);
+                          }}
+                          title="Delete"
+                        >
+                          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                            <path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+                          </svg>
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                  
+                  <button
+                    className="btn-secondary"
+                    onClick={() => {
+                      const newFunction = {
+                        name: 'end_call',
+                        description: 'End the call when user says goodbye, bye, or similar phrases',
+                        enabled: true,
+                        triggers: ['bye', 'goodbye', 'see you', 'talk later', 'end call', 'hang up'],
+                        config: {}
+                      };
+                      setFunctions([...functions, newFunction]);
+                    }}
+                    style={{ width: '100%', marginTop: '0.5rem' }}
+                  >
+                    + Add
+                  </button>
                 </div>
               )}
             </div>

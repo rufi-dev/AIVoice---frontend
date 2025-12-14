@@ -4,6 +4,7 @@ import axios from 'axios';
 import './VoiceSelectionModal.css';
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:5000/api';
+const BACKEND_URL = import.meta.env.VITE_API_URL?.replace('/api', '') || 'http://localhost:5000';
 
 const OPENAI_MODELS = [
   { id: 'gpt-4', name: 'GPT-4' },
@@ -48,11 +49,23 @@ function VoiceSelectionModal({ isOpen, onClose, onSelect, currentSettings }) {
     type: ''
   });
   const [searchQuery, setSearchQuery] = useState('');
+  const [playingVoiceId, setPlayingVoiceId] = useState(null);
+  const [previewAudio, setPreviewAudio] = useState(null);
 
   useEffect(() => {
     if (isOpen) {
       fetchVoices();
     }
+    
+    // Cleanup: stop audio when modal closes
+    return () => {
+      if (previewAudio) {
+        previewAudio.pause();
+        previewAudio.currentTime = 0;
+        setPreviewAudio(null);
+      }
+      setPlayingVoiceId(null);
+    };
   }, [isOpen]);
 
   const fetchVoices = async () => {
@@ -121,6 +134,101 @@ function VoiceSelectionModal({ isOpen, onClose, onSelect, currentSettings }) {
     console.log('🎤 Calling onSelect with:', newSettings);
     onSelect(newSettings);
     onClose();
+  };
+
+  const handleVoicePreview = async (voice, e) => {
+    e.stopPropagation();
+    
+    const voiceId = voice.id || voice.voiceId;
+    const voiceName = voice.name;
+    
+    // Stop any currently playing audio
+    if (previewAudio) {
+      previewAudio.pause();
+      previewAudio.currentTime = 0;
+      setPreviewAudio(null);
+    }
+    
+    // If clicking the same voice that's playing, just stop it
+    if (playingVoiceId === voiceId) {
+      setPlayingVoiceId(null);
+      return;
+    }
+    
+    setPlayingVoiceId(voiceId);
+    
+    try {
+      console.log(`🎵 Previewing voice: ${voiceName} (${voiceId})`);
+      
+      const response = await axios.post(`${API_BASE_URL}/voices/preview`, {
+        voiceId: voiceId,
+        voiceName: voiceName
+      }, {
+        responseType: 'arraybuffer' // Expect binary audio data
+      });
+      
+      // Preview audio is now streamed directly (not JSON response)
+      // The response is the audio file itself
+      const audioBlob = new Blob([response.data], { type: 'audio/mpeg' });
+      const audioUrl = URL.createObjectURL(audioBlob);
+
+      console.log('🔊 Playing preview audio from blob URL');
+
+      const audio = new Audio(audioUrl);
+      setPreviewAudio(audio);
+      
+      audio.onended = () => {
+        console.log('✅ Preview finished');
+        setPlayingVoiceId(null);
+        setPreviewAudio(null);
+        // Clean up blob URL
+        if (audioUrl && audioUrl.startsWith('blob:')) {
+          URL.revokeObjectURL(audioUrl);
+        }
+      };
+      
+      audio.onerror = (error) => {
+        console.error('❌ Error playing preview audio:', error);
+        setPlayingVoiceId(null);
+        setPreviewAudio(null);
+        if (audioUrl && audioUrl.startsWith('blob:')) {
+          URL.revokeObjectURL(audioUrl);
+        }
+        alert('Failed to play voice preview. Please try again.');
+      };
+      
+      // Wait for audio to be ready before playing
+      audio.oncanplaythrough = async () => {
+        try {
+          await audio.play();
+          console.log('✅ Preview started playing');
+        } catch (playError) {
+          console.error('❌ Error starting playback:', playError);
+          setPlayingVoiceId(null);
+          setPreviewAudio(null);
+          alert('Failed to start playback. Please check browser console.');
+        }
+      };
+      
+      // If audio fails to load
+      audio.onloadstart = () => console.log('🔄 Audio loading started');
+      audio.onloadeddata = () => console.log('✅ Audio data loaded');
+      
+      // Start loading the audio
+      audio.load();
+      
+    } catch (error) {
+      console.error('❌ Error previewing voice:', error);
+      console.error('Error details:', {
+        message: error.message,
+        response: error.response?.data,
+        status: error.response?.status,
+        statusText: error.response?.statusText
+      });
+      setPlayingVoiceId(null);
+      const errorMessage = error.response?.data?.error || error.response?.data?.details || error.message || 'Failed to preview voice';
+      alert(`Failed to preview voice: ${errorMessage}`);
+    }
   };
 
   // Combine predefined and custom voices
@@ -279,15 +387,20 @@ function VoiceSelectionModal({ isOpen, onClose, onSelect, currentSettings }) {
                         <div className="voice-id">ID: {voiceId}</div>
                       </div>
                       <button 
-                        className="voice-play-btn"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          // TODO: Implement voice preview
-                        }}
+                        className={`voice-play-btn ${playingVoiceId === voiceId ? 'playing' : ''}`}
+                        onClick={(e) => handleVoicePreview(voice, e)}
+                        title={playingVoiceId === voiceId ? 'Stop preview' : 'Preview voice'}
                       >
-                        <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
-                          <polygon points="5 3 19 12 5 21"></polygon>
-                        </svg>
+                        {playingVoiceId === voiceId ? (
+                          <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+                            <rect x="6" y="4" width="4" height="16"></rect>
+                            <rect x="14" y="4" width="4" height="16"></rect>
+                          </svg>
+                        ) : (
+                          <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+                            <polygon points="5 3 19 12 5 21"></polygon>
+                          </svg>
+                        )}
                       </button>
                       {isSelected && (
                         <div className="voice-selected-check">

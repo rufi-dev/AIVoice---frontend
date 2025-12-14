@@ -243,6 +243,23 @@ function CallHistory() {
                 </div>
               </div>
 
+              {selectedCall.audioUrl && (
+                <div className="detail-section">
+                  <h3 className="detail-section-title">Full Conversation Audio</h3>
+                  <div className="audio-player-container">
+                    <audio 
+                      controls 
+                      src={selectedCall.audioUrl.startsWith('http') 
+                        ? selectedCall.audioUrl 
+                        : `${API_BASE_URL.replace('/api', '')}${selectedCall.audioUrl}`}
+                      style={{ width: '100%' }}
+                    >
+                      Your browser does not support the audio element.
+                    </audio>
+                  </div>
+                </div>
+              )}
+
               <div className="detail-section">
                 <h3 className="detail-section-title">Transcription</h3>
                 <div className="transcription-content">
