@@ -74,6 +74,8 @@ function AgentDetail() {
   const cuttingAudioRef = useRef(null);
   const recognitionRef = useRef(null);
   const isProcessingRef = useRef(false);
+  const pendingMessageRef = useRef(null);
+  const messageDebounceTimeoutRef = useRef(null);
   const isActiveRef = useRef(false);
   const wasInterruptedRef = useRef(false);
   const resumeTimeoutRef = useRef(null);
@@ -197,6 +199,12 @@ function AgentDetail() {
   const handleUserMessage = useCallback(async (userMessage) => {
     if (!conversationId) return;
     
+    // Prevent duplicate processing - if already processing, ignore this message
+    if (isProcessingRef.current) {
+      console.log('⚠️ Already processing, ignoring duplicate message:', userMessage);
+      return;
+    }
+    
     // Check if this is an interruption (user speaking while AI is processing or speaking)
     const isInterruption = isProcessingRef.current || (audioRef.current && audioRef.current.currentTime > 0);
     
@@ -250,6 +258,16 @@ function AgentDetail() {
       setMessages(prev => [...prev, { role: 'assistant', content: aiResponse }]);
 
       // Play audio response - but keep listening while playing
+      // Ensure only one audio plays at a time - stop any existing audio first
+      if (audioRef.current) {
+        audioRef.current.pause();
+        audioRef.current = null;
+      }
+      if (cuttingAudioRef.current) {
+        cuttingAudioRef.current.pause();
+        cuttingAudioRef.current = null;
+      }
+      
       if (audioUrl && isActiveRef.current) {
         // Audio URL is now /api/audio/{fileId} from MongoDB GridFS
         const fullAudioUrl = audioUrl.startsWith('http') 
@@ -505,15 +523,43 @@ function AgentDetail() {
 
         if (final.trim()) {
           setInterimTranscript('');
-          // Clear paused audio state since we're processing a new message
-          if (resumeTimeoutRef.current) {
-            clearTimeout(resumeTimeoutRef.current);
-            resumeTimeoutRef.current = null;
+          
+          // Clear any pending debounce timeout
+          if (messageDebounceTimeoutRef.current) {
+            clearTimeout(messageDebounceTimeoutRef.current);
+            messageDebounceTimeoutRef.current = null;
           }
-          setPausedAudioState(null);
-          wasInterruptedRef.current = false;
-          // Process the message even if currently processing (interruption)
-          handleUserMessage(final.trim());
+          
+          // Debounce rapid speech results - wait 300ms to see if more speech comes
+          // This prevents processing multiple messages when user speaks in quick succession
+          const messageToProcess = final.trim();
+          pendingMessageRef.current = messageToProcess;
+          
+          messageDebounceTimeoutRef.current = setTimeout(() => {
+            const message = pendingMessageRef.current;
+            pendingMessageRef.current = null;
+            messageDebounceTimeoutRef.current = null;
+            
+            if (!message) return;
+            
+            // Clear paused audio state since we're processing a new message
+            if (resumeTimeoutRef.current) {
+              clearTimeout(resumeTimeoutRef.current);
+              resumeTimeoutRef.current = null;
+            }
+            setPausedAudioState(null);
+            wasInterruptedRef.current = false;
+            
+            // Prevent duplicate processing - only process if not already processing
+            // This prevents multiple API calls when user speaks in quick succession
+            if (!isProcessingRef.current) {
+              // Process the message
+              handleUserMessage(message);
+            } else {
+              // If already processing, ignore this message
+              console.log('⚠️ Ignoring message while processing:', message);
+            }
+          }, 300); // 300ms debounce - wait for more speech
         }
       };
 
