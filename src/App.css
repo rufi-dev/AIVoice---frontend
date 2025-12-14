@@ -1,0 +1,13 @@
+.app {
+  display: flex;
+  height: 100vh;
+  background: #f9fafb;
+  overflow: hidden;
+}
+
+/* Adjust main content when sidebar is present */
+.app > :not(.sidebar) {
+  margin-left: 240px;
+  flex: 1;
+  overflow-y: auto;
+}
