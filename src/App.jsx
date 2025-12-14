@@ -84,6 +84,8 @@ function AppRoutes() {
             </ProtectedRoute>
           }
         />
+        {/* Catch-all route - redirect to login if route not found */}
+        <Route path="*" element={<Navigate to="/login" replace />} />
       </Routes>
     </>
   );

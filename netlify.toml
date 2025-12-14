@@ -2,7 +2,9 @@
   publish = "dist"
   command = "npm run build"
 
+# SPA fallback - redirect all routes to index.html
 [[redirects]]
   from = "/*"
   to = "/index.html"
   status = 200
+  force = true
