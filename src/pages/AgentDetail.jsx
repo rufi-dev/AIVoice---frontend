@@ -71,6 +71,8 @@ function AgentDetail() {
     pauseBeforeSpeaking: 0,
     aiSpeaksFirst: true
   });
+  const [shareableLink, setShareableLink] = useState('');
+  const [isPublic, setIsPublic] = useState(false);
   
   const audioRef = useRef(null);
   const cuttingAudioRef = useRef(null);
@@ -127,7 +129,15 @@ function AgentDetail() {
       if (response.data.functions && response.data.functions.length > 0) {
         console.log('📋 Loaded functions from agent:', response.data.functions);
         setFunctions(response.data.functions);
+      }
+      if (response.data.shareableToken) {
+        const baseUrl = window.location.origin;
+        setShareableLink(`${baseUrl}/test/${response.data.shareableToken}`);
       } else {
+        setShareableLink('');
+      }
+      setIsPublic(response.data.isPublic || false);
+      if (!response.data.functions || response.data.functions.length === 0) {
         // Initialize with default end_call function if none exist
         console.log('📋 No functions found, initializing default end_call function');
         const defaultFunction = [{
@@ -159,6 +169,47 @@ function AgentDetail() {
       setKnowledgeBases(response.data);
     } catch (error) {
       console.error('Error fetching knowledge bases:', error);
+    }
+  };
+
+  const generateShareableLink = async () => {
+    try {
+      const response = await axios.post(`${API_BASE_URL}/agents/${id}/generate-token`);
+      const baseUrl = window.location.origin;
+      setShareableLink(`${baseUrl}/test/${response.data.shareableToken}`);
+      setIsPublic(true);
+      setAgent(response.data);
+      alert('Shareable link generated! You can now share this agent publicly.');
+    } catch (error) {
+      console.error('Error generating shareable link:', error);
+      alert('Failed to generate shareable link');
+    }
+  };
+
+  const togglePublicStatus = async () => {
+    try {
+      const newPublicStatus = !isPublic;
+      const response = await axios.put(`${API_BASE_URL}/agents/${id}`, {
+        isPublic: newPublicStatus
+      });
+      setIsPublic(newPublicStatus);
+      if (newPublicStatus && response.data.shareableToken) {
+        const baseUrl = window.location.origin;
+        setShareableLink(`${baseUrl}/test/${response.data.shareableToken}`);
+      } else if (!newPublicStatus) {
+        setShareableLink('');
+      }
+      setAgent(response.data);
+    } catch (error) {
+      console.error('Error updating public status:', error);
+      alert('Failed to update public status');
+    }
+  };
+
+  const copyShareableLink = () => {
+    if (shareableLink) {
+      navigator.clipboard.writeText(shareableLink);
+      alert('Link copied to clipboard!');
     }
   };
 
@@ -1302,6 +1353,87 @@ function AgentDetail() {
         }}
         currentSettings={speechSettings}
       />
+
+      {/* Shareable Link Section */}
+      <div className="shareable-link-section" style={{
+        marginTop: '2rem',
+        marginLeft: '1rem',
+        marginRight: '1rem',
+        padding: '1.5rem',
+        background: '#f9fafb',
+        borderRadius: '0.75rem',
+        border: '1px solid #e5e7eb'
+      }}>
+        <h3 style={{ marginBottom: '1rem', fontSize: '1.1rem', fontWeight: 600 }}>
+          Shareable Link
+        </h3>
+        <p style={{ fontSize: '0.875rem', color: '#6b7280', marginBottom: '1rem' }}>
+          Generate a public link to share this agent with others. Anyone with the link can test your agent.
+        </p>
+        
+        {!shareableLink ? (
+          <button
+            className="btn-primary"
+            onClick={generateShareableLink}
+            style={{ width: '100%' }}
+          >
+            Generate Shareable Link
+          </button>
+        ) : (
+          <>
+            <div style={{
+              display: 'flex',
+              gap: '0.5rem',
+              marginBottom: '1rem',
+              alignItems: 'center'
+            }}>
+              <input
+                type="text"
+                value={shareableLink}
+                readOnly
+                style={{
+                  flex: 1,
+                  padding: '0.75rem',
+                  border: '1px solid #d1d5db',
+                  borderRadius: '0.5rem',
+                  fontSize: '0.875rem',
+                  background: 'white'
+                }}
+              />
+              <button
+                className="btn-secondary"
+                onClick={copyShareableLink}
+                title="Copy link"
+              >
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+                  <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+                </svg>
+              </button>
+            </div>
+            <div style={{
+              display: 'flex',
+              gap: '0.5rem',
+              alignItems: 'center'
+            }}>
+              <label style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: '0.5rem',
+                cursor: 'pointer',
+                fontSize: '0.875rem'
+              }}>
+                <input
+                  type="checkbox"
+                  checked={isPublic}
+                  onChange={togglePublicStatus}
+                />
+                <span>Public (accessible via link)</span>
+              </label>
+            </div>
+          </>
+        )}
+      </div>
     </div>
   );
 }

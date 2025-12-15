@@ -6,8 +6,8 @@
 }
 
 /* Adjust main content when sidebar is present */
-/* Exclude auth pages (login/register) from the margin */
-.app > :not(.sidebar):not(.auth-container) {
+/* Exclude auth pages (login/register) and public test pages from the margin */
+.app > :not(.sidebar):not(.auth-container):not(.public-agent-container) {
   margin-left: 240px;
   flex: 1;
   overflow-y: auto;
@@ -18,4 +18,15 @@
   margin-left: 0;
   width: 100%;
   flex: 1;
+}
+
+/* Public agent test page should take full width and height */
+.app > .public-agent-container {
+  margin-left: 0;
+  width: 100vw;
+  height: 100vh;
+  position: fixed;
+  top: 0;
+  left: 0;
+  z-index: 1000;
 }

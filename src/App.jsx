@@ -1,4 +1,4 @@
-import { BrowserRouter as Router, Routes, Route, Navigate } from 'react-router-dom';
+import { BrowserRouter as Router, Routes, Route, Navigate, useLocation } from 'react-router-dom';
 import { AuthProvider, useAuth } from './contexts/AuthContext';
 import Sidebar from './components/Sidebar';
 import Dashboard from './pages/Dashboard';
@@ -7,6 +7,7 @@ import KnowledgeBase from './pages/KnowledgeBase';
 import CallHistory from './pages/CallHistory';
 import Login from './pages/Login';
 import Register from './pages/Register';
+import PublicAgentTest from './pages/PublicAgentTest';
 import './App.css';
 
 // Protected Route Component
@@ -45,13 +46,19 @@ const PublicRoute = ({ children }) => {
 
 function AppRoutes() {
   const { isAuthenticated } = useAuth();
+  const location = useLocation();
+  
+  // Hide sidebar for public test routes
+  const isPublicRoute = location.pathname.startsWith('/test/');
+  const showSidebar = isAuthenticated && !isPublicRoute;
 
   return (
     <>
-      {isAuthenticated && <Sidebar />}
+      {showSidebar && <Sidebar />}
       <Routes>
         <Route path="/login" element={<PublicRoute><Login /></PublicRoute>} />
         <Route path="/register" element={<PublicRoute><Register /></PublicRoute>} />
+        <Route path="/test/:token" element={<PublicAgentTest />} />
         <Route
           path="/"
           element={
