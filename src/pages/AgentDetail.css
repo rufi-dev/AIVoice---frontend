@@ -26,6 +26,12 @@
   padding: 1.5rem 2rem;
   background: white;
   border-bottom: 1px solid #e5e7eb;
+  gap: 1rem;
+}
+
+.agent-detail-title {
+  flex: 1;
+  min-width: 0;
 }
 
 .agent-detail-title h1 {
