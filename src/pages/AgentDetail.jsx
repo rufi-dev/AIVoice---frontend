@@ -130,7 +130,8 @@ function AgentDetail() {
         console.log('📋 Loaded functions from agent:', response.data.functions);
         setFunctions(response.data.functions);
       }
-      if (response.data.shareableToken) {
+      // Only set shareable link if agent is public AND has a token
+      if (response.data.isPublic && response.data.shareableToken) {
         const baseUrl = window.location.origin;
         setShareableLink(`${baseUrl}/test/${response.data.shareableToken}`);
       } else {
@@ -949,14 +950,6 @@ function AgentDetail() {
             minWidth: '600px',
             maxWidth: '100%'
           }}>
-            <label style={{
-              fontSize: '0.875rem',
-              fontWeight: 500,
-              color: '#374151',
-              marginBottom: '0.25rem'
-            }}>
-              Shareable Link
-            </label>
             {!shareableLink ? (
               <button
                 className="btn-secondary"
