@@ -10,6 +10,65 @@ const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:5000/api'
 // Helper to get full backend URL (without /api) for absolute URLs
 const BACKEND_URL = import.meta.env.VITE_API_URL?.replace('/api', '') || 'http://localhost:5000';
 
+function getApiOrigin() {
+  try {
+    // VITE_API_URL is expected to be absolute (https://.../api)
+    const origin = new URL(API_BASE_URL).origin;
+    // If someone accidentally built with localhost, don't use it in production.
+    if (origin.includes('localhost') || origin.includes('127.0.0.1')) {
+      throw new Error('Invalid API origin (localhost)');
+    }
+    return origin;
+  } catch (e) {
+    // Fallback: infer API origin from dashboard domain.
+    // Example: https://dashboard.rapidcallai.com -> https://api.rapidcallai.com
+    try {
+      const { protocol, hostname } = window.location;
+      if (hostname.startsWith('dashboard.')) {
+        return `${protocol}//api.${hostname.slice('dashboard.'.length)}`;
+      }
+      // If already on api.* just use it
+      if (hostname.startsWith('api.')) {
+        return `${protocol}//${hostname}`;
+      }
+      // Last resort: current origin
+      return window.location.origin;
+    } catch {
+      return window.location.origin;
+    }
+  }
+}
+
+function normalizeBackendPath(pathOrUrl) {
+  if (!pathOrUrl) return null;
+  const raw = String(pathOrUrl);
+  if (!raw) return null;
+
+  // If it's already absolute, use as-is.
+  if (raw.startsWith('http://') || raw.startsWith('https://')) return raw;
+
+  // Fix a common broken prefix seen in production: "/.rapidcallai.com/api/api/..."
+  let p = raw;
+  if (p.startsWith('/.rapidcallai.com/')) {
+    p = p.replace('/.rapidcallai.com', '');
+  }
+  // Collapse duplicate /api/api/ into /api/
+  p = p.replace('/api/api/', '/api/');
+
+  // Ensure leading slash for path-like URLs
+  if (!p.startsWith('/')) p = `/${p}`;
+  return p;
+}
+
+function toBackendAbsoluteUrl(pathOrUrl) {
+  const normalized = normalizeBackendPath(pathOrUrl);
+  if (!normalized) return null;
+  // If normalizeBackendPath returned absolute URL, keep it.
+  if (normalized.startsWith('http://') || normalized.startsWith('https://')) return normalized;
+  // Always use API origin for backend assets (audio), never the dashboard origin.
+  return `${getApiOrigin()}${normalized}`;
+}
+
 const OPENAI_MODELS = [
   { id: 'gpt-4', name: 'GPT-4' },
   { id: 'gpt-4-turbo', name: 'GPT-4 Turbo' },
@@ -157,7 +216,12 @@ function AgentDetail() {
     if (!next) return;
     isPlayingQueueRef.current = true;
 
-    const fullUrl = next.startsWith('http') ? next : `${BACKEND_URL}${next}`;
+    const fullUrl = toBackendAbsoluteUrl(next);
+    if (!fullUrl) {
+      isPlayingQueueRef.current = false;
+      setTimeout(() => playNextQueuedAudio(), 0);
+      return;
+    }
     const audio = new Audio(fullUrl);
     // Mark this as chunked so interruption logic can treat it differently
     audio._isChunkedTts = true;
@@ -324,10 +388,8 @@ function AgentDetail() {
       }
 
       if (callSettings.aiSpeaksFirst && response.data.initialAudioUrl && isActiveRef.current) {
-        const audioUrl = response.data.initialAudioUrl.startsWith('http')
-          ? response.data.initialAudioUrl
-          : `${BACKEND_URL}${response.data.initialAudioUrl}`;
-        const audio = new Audio(audioUrl);
+        const audioUrl = toBackendAbsoluteUrl(response.data.initialAudioUrl);
+        const audio = audioUrl ? new Audio(audioUrl) : null;
         audioRef.current = audio;
         audio.onended = () => {
           audioRef.current = null;
@@ -337,7 +399,7 @@ function AgentDetail() {
           audioRef.current = null;
           startListening();
         };
-        audio.play().catch(() => {
+        audio?.play().catch(() => {
           audioRef.current = null;
           startListening();
         });
@@ -930,18 +992,15 @@ function AgentDetail() {
             });
             
             if (cuttingResponse.data.audioUrl && isActiveRef.current) {
-              // Audio URL is now /api/audio/{fileId} from MongoDB GridFS
-              const cuttingAudioUrl = cuttingResponse.data.audioUrl.startsWith('http') 
-                ? cuttingResponse.data.audioUrl 
-                : `${BACKEND_URL}${cuttingResponse.data.audioUrl}`;
-              const cuttingAudio = new Audio(cuttingAudioUrl);
+              const cuttingAudioUrl = toBackendAbsoluteUrl(cuttingResponse.data.audioUrl);
+              const cuttingAudio = cuttingAudioUrl ? new Audio(cuttingAudioUrl) : null;
               cuttingAudioRef.current = cuttingAudio;
               
               cuttingAudio.onended = () => {
                 cuttingAudioRef.current = null;
               };
               
-              cuttingAudio.play().catch(() => {
+              cuttingAudio?.play().catch(() => {
                 cuttingAudioRef.current = null;
               });
             }
