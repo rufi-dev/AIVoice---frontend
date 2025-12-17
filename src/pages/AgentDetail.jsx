@@ -46,6 +46,8 @@ function AgentDetail() {
   const [messages, setMessages] = useState([]);
   const [isProcessing, setIsProcessing] = useState(false);
   const [interimTranscript, setInterimTranscript] = useState('');
+  const [assistantDraft, setAssistantDraft] = useState('');
+  const [latencyInfo, setLatencyInfo] = useState(null);
   const [pausedAudioState, setPausedAudioState] = useState(null);
   const [knowledgeBases, setKnowledgeBases] = useState([]);
   const [selectedKB, setSelectedKB] = useState('');
@@ -71,12 +73,14 @@ function AgentDetail() {
     pauseBeforeSpeaking: 0,
     aiSpeaksFirst: true
   });
+  // Legacy-only: browser SpeechRecognition + HTTP chat
   const [shareableLink, setShareableLink] = useState('');
   const [isPublic, setIsPublic] = useState(false);
   
   const audioRef = useRef(null);
   const cuttingAudioRef = useRef(null);
   const recognitionRef = useRef(null);
+  const recognitionRunningRef = useRef(false);
   const isProcessingRef = useRef(false);
   const pendingMessageRef = useRef(null);
   const messageDebounceTimeoutRef = useRef(null);
@@ -84,6 +88,271 @@ function AgentDetail() {
   const wasInterruptedRef = useRef(false);
   const resumeTimeoutRef = useRef(null);
   const isInterruptingRef = useRef(false);
+  const prefetchAbortRef = useRef(null);
+  const prefetchDebounceTimeoutRef = useRef(null);
+  const prefetchCooldownUntilRef = useRef(0);
+  const prefetchLastAtRef = useRef(0);
+  const prefetchLastTextRef = useRef('');
+  const prefetchHiddenTextRef = useRef('');
+  const audioQueueRef = useRef([]);
+  const isPlayingQueueRef = useRef(false);
+  const utteranceStartPerfRef = useRef(null);
+  const lastFinalClientTimingsRef = useRef(null);
+
+  // (Streaming/Deepgram removed)
+
+  const safeStartRecognition = useCallback((delayMs = 0) => {
+    if (!isActiveRef.current) return;
+    if (!recognitionRef.current) return;
+    if (recognitionRunningRef.current) return;
+
+    const run = () => {
+      if (!isActiveRef.current) return;
+      if (!recognitionRef.current) return;
+      if (recognitionRunningRef.current) return;
+      try {
+        // Optimistically mark running to avoid double-start spam.
+        recognitionRunningRef.current = true;
+        recognitionRef.current.start();
+      } catch (e) {
+        recognitionRunningRef.current = false;
+      }
+    };
+
+    if (delayMs > 0) setTimeout(run, delayMs);
+    else run();
+  }, []);
+
+  const stopPrefetch = useCallback(() => {
+    if (prefetchDebounceTimeoutRef.current) {
+      clearTimeout(prefetchDebounceTimeoutRef.current);
+      prefetchDebounceTimeoutRef.current = null;
+    }
+    if (prefetchAbortRef.current) {
+      try {
+        prefetchAbortRef.current.abort();
+      } catch (e) {}
+      prefetchAbortRef.current = null;
+    }
+    // Prefetch should not show assistant text; keep it hidden.
+    prefetchHiddenTextRef.current = '';
+    setLatencyInfo(null);
+  }, []);
+
+  const stopAssistantAudioQueue = useCallback(() => {
+    audioQueueRef.current = [];
+    isPlayingQueueRef.current = false;
+    if (audioRef.current) {
+      try {
+        audioRef.current.pause();
+      } catch (e) {}
+      audioRef.current = null;
+    }
+  }, []);
+
+  const playNextQueuedAudio = useCallback(() => {
+    if (!isActiveRef.current) return;
+    if (isPlayingQueueRef.current) return;
+    const next = audioQueueRef.current.shift();
+    if (!next) return;
+    isPlayingQueueRef.current = true;
+
+    const fullUrl = next.startsWith('http') ? next : `${BACKEND_URL}${next}`;
+    const audio = new Audio(fullUrl);
+    // Mark this as chunked so interruption logic can treat it differently
+    audio._isChunkedTts = true;
+    audioRef.current = audio;
+
+    audio.onended = () => {
+      audioRef.current = null;
+      isPlayingQueueRef.current = false;
+      // Continue queue
+      setTimeout(() => playNextQueuedAudio(), 0);
+    };
+    audio.onerror = () => {
+      audioRef.current = null;
+      isPlayingQueueRef.current = false;
+      setTimeout(() => playNextQueuedAudio(), 0);
+    };
+
+    // Keep listening while the agent speaks
+    if (isActiveRef.current) {
+      setIsListening(true);
+      safeStartRecognition(50);
+    }
+
+    audio.play().catch(() => {
+      audioRef.current = null;
+      isPlayingQueueRef.current = false;
+      setTimeout(() => playNextQueuedAudio(), 0);
+    });
+  }, [safeStartRecognition]);
+
+  const enqueueAssistantAudio = useCallback((audioUrl) => {
+    if (!audioUrl) return;
+    audioQueueRef.current.push(audioUrl);
+    // Start if idle
+    if (!isPlayingQueueRef.current) {
+      playNextQueuedAudio();
+    }
+  }, [playNextQueuedAudio]);
+
+  const streamNdjson = useCallback(async ({ url, body, onEvent, signal }) => {
+    const token = localStorage.getItem('token');
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(token ? { Authorization: `Bearer ${token}` } : {})
+      },
+      body: JSON.stringify(body),
+      signal
+    });
+    if (!resp.ok) {
+      const text = await resp.text().catch(() => '');
+      throw new Error(text || `Request failed (${resp.status})`);
+    }
+    const reader = resp.body?.getReader?.();
+    if (!reader) return;
+
+    const decoder = new TextDecoder();
+    let buffer = '';
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let idx;
+      while ((idx = buffer.indexOf('\n')) >= 0) {
+        const line = buffer.slice(0, idx).trim();
+        buffer = buffer.slice(idx + 1);
+        if (!line) continue;
+        try {
+          const evt = JSON.parse(line);
+          onEvent?.(evt);
+        } catch (e) {
+          // ignore bad lines
+        }
+      }
+    }
+  }, []);
+
+  const stopConversation = useCallback(async () => {
+    isActiveRef.current = false;
+    isProcessingRef.current = false;
+    setIsActive(false);
+    setIsListening(false);
+    setIsProcessing(false);
+    setInterimTranscript('');
+    stopPrefetch();
+    stopAssistantAudioQueue();
+    if (recognitionRef.current) {
+      try {
+        recognitionRef.current.stop();
+        recognitionRunningRef.current = false;
+      } catch (e) {}
+    }
+    if (audioRef.current) {
+      audioRef.current.pause();
+      audioRef.current = null;
+    }
+    if (cuttingAudioRef.current) {
+      cuttingAudioRef.current.pause();
+      cuttingAudioRef.current = null;
+    }
+    setPausedAudioState(null);
+    wasInterruptedRef.current = false;
+    if (resumeTimeoutRef.current) {
+      clearTimeout(resumeTimeoutRef.current);
+      resumeTimeoutRef.current = null;
+    }
+
+    // End the call and save to history
+    if (conversationId) {
+      try {
+        await axios.post(`${API_BASE_URL}/conversation/${conversationId}/end`, {
+          endReason: 'user_hangup'
+        });
+      } catch (error) {
+        console.error('Error ending call:', error);
+      }
+    }
+  }, [conversationId, stopPrefetch, stopAssistantAudioQueue]);
+
+  const startConversationLegacy = useCallback(async () => {
+    if (!systemPrompt.trim()) {
+      alert('Please enter a system prompt for the agent');
+      return;
+    }
+
+    try {
+      // Stop any streaming session first
+      await stopConversation();
+
+      isProcessingRef.current = true;
+      setIsProcessing(true);
+
+      const response = await axios.post(`${API_BASE_URL}/conversation/start`, {
+        systemPrompt: systemPrompt.trim(),
+        agentId: id,
+        knowledgeBaseId: selectedKB || null,
+        aiSpeaksFirst: callSettings.aiSpeaksFirst || false
+      });
+
+      setConversationId(response.data.conversationId);
+      setIsActive(true);
+      isActiveRef.current = true;
+      setMessages([]);
+      setInterimTranscript('');
+
+      isProcessingRef.current = false;
+      setIsProcessing(false);
+
+      const startListening = () => {
+        setIsListening(true);
+        setTimeout(() => {
+          if (recognitionRef.current && isActiveRef.current) {
+            try {
+              recognitionRef.current.start();
+            } catch (e) {}
+          }
+        }, 150);
+      };
+
+      // AI greeting (optional)
+      if (callSettings.aiSpeaksFirst && response.data.initialGreeting) {
+        setMessages(prev => [...prev, { role: 'assistant', content: response.data.initialGreeting }]);
+      }
+
+      if (callSettings.aiSpeaksFirst && response.data.initialAudioUrl && isActiveRef.current) {
+        const audioUrl = response.data.initialAudioUrl.startsWith('http')
+          ? response.data.initialAudioUrl
+          : `${BACKEND_URL}${response.data.initialAudioUrl}`;
+        const audio = new Audio(audioUrl);
+        audioRef.current = audio;
+        audio.onended = () => {
+          audioRef.current = null;
+          startListening();
+        };
+        audio.onerror = () => {
+          audioRef.current = null;
+          startListening();
+        };
+        audio.play().catch(() => {
+          audioRef.current = null;
+          startListening();
+        });
+      } else {
+        startListening();
+      }
+    } catch (err) {
+      console.error('Legacy start failed:', err);
+      alert(err?.response?.data?.error || err.message || 'Failed to start conversation');
+      isProcessingRef.current = false;
+      setIsProcessing(false);
+    }
+  }, [systemPrompt, id, selectedKB, callSettings.aiSpeaksFirst, stopConversation]);
+
+  // (Streaming/Deepgram removed)
 
   useEffect(() => {
     fetchAgent();
@@ -328,34 +597,79 @@ function AgentDetail() {
     isProcessingRef.current = true;
     setIsProcessing(true);
     setInterimTranscript('');
+    stopPrefetch();
+    stopAssistantAudioQueue();
+    setAssistantDraft('');
+    setLatencyInfo(null);
 
     setMessages(prev => [...prev, { role: 'user', content: userMessage }]);
 
     try {
-      // Get streaming response from backend
-      const response = await axios.post(`${API_BASE_URL}/conversation/chat`, {
-        message: userMessage,
-        conversationId: conversationId,
-        agentId: id
-      });
+      // Stream response + early chunked TTS
+      const ac = new AbortController();
+      // If user starts speaking again, we can cancel by calling stopPrefetch/stopAssistantAudioQueue, but chat stream is per-turn.
 
-      const aiResponse = response.data.text;
-      const audioUrl = response.data.audioUrl;
-      const shouldEndCall = response.data.shouldEndCall || false;
+      let fullAssistantText = '';
+      let shouldEndCall = false;
+      let receivedAny = false;
+      const stallTimer = setTimeout(() => {
+        if (!receivedAny) {
+          try {
+            ac.abort();
+          } catch (e) {}
+        }
+      }, 20000); // GPT-4 can take longer; don't abort too aggressively
 
-      console.log('📥 Response received:', { 
-        hasText: !!aiResponse, 
-        hasAudio: !!audioUrl, 
-        shouldEndCall 
+      await streamNdjson({
+        url: `${API_BASE_URL}/conversation/chat-stream`,
+        body: {
+          message: userMessage,
+          conversationId: conversationId,
+          agentId: id,
+          clientTimings: lastFinalClientTimingsRef.current || undefined
+        },
+        signal: ac.signal,
+        onEvent: (evt) => {
+          if (!evt || !evt.type) return;
+          receivedAny = true;
+          if (evt.type === 'assistant_delta') {
+            fullAssistantText += evt.delta || '';
+            setAssistantDraft(fullAssistantText);
+          }
+          if (evt.type === 'tts_audio' && evt.audioUrl) {
+            enqueueAssistantAudio(evt.audioUrl);
+          }
+          if (evt.type === 'latency') {
+            setLatencyInfo(evt.latency || null);
+          }
+          if (evt.type === 'rate_limited') {
+            // stop the stream and let the catch() path fallback / retry
+            try {
+              ac.abort();
+            } catch (e) {}
+          }
+          if (evt.type === 'final') {
+            if (typeof evt.text === 'string') {
+              fullAssistantText = evt.text;
+              setAssistantDraft(evt.text);
+            }
+            shouldEndCall = !!evt.shouldEndCall;
+          }
+        }
       });
+      clearTimeout(stallTimer);
 
       // Always show the response - the interruption flag was just for tracking
       // Reset the interruption flag after we get the response
       const wasInterruption = isInterruptingRef.current;
       isInterruptingRef.current = false;
 
-      // Show full response immediately
-      setMessages(prev => [...prev, { role: 'assistant', content: aiResponse }]);
+      // Commit assistant message to transcript
+      const finalText = (fullAssistantText || '').trim();
+      if (finalText) {
+        setMessages(prev => [...prev, { role: 'assistant', content: finalText }]);
+      }
+      setAssistantDraft('');
       
       // If end_call function was triggered, stop the conversation (exactly like pressing Stop button)
       if (shouldEndCall) {
@@ -375,112 +689,48 @@ function AgentDetail() {
         // Don't continue with audio playback - conversation is ended
         return;
       }
-
-      // Play audio response - but keep listening while playing
-      // Ensure only one audio plays at a time - stop any existing audio first
-      if (audioRef.current) {
-        audioRef.current.pause();
-        audioRef.current = null;
-      }
-      if (cuttingAudioRef.current) {
-        cuttingAudioRef.current.pause();
-        cuttingAudioRef.current = null;
-      }
-
-      if (audioUrl && isActiveRef.current) {
-        // Audio URL is now /api/audio/{fileId} from MongoDB GridFS
-        const fullAudioUrl = audioUrl.startsWith('http') 
-          ? audioUrl 
-          : `${BACKEND_URL}${audioUrl}`;
-        const audio = new Audio(fullAudioUrl);
-        audioRef.current = audio;
-
-        // Always restart listening after we get a response (even while processing)
-        // This ensures we can capture the next user message
+      // Audio is streamed in chunks; playback is handled via queue in enqueueAssistantAudio().
+      // Always keep listening.
+      if (isActiveRef.current) {
         setIsListening(true);
         setTimeout(() => {
           if (recognitionRef.current && isActiveRef.current) {
             try {
               recognitionRef.current.start();
-            } catch (e) {
-              // Recognition might already be running, that's fine
-              console.log('Recognition already running or starting');
-            }
+            } catch (e) {}
           }
         }, 100);
-
-        audio.onended = () => {
-          audioRef.current = null;
-          // Always restart listening after audio ends
-          if (isActiveRef.current) {
-            setIsListening(true);
-            setTimeout(() => {
-              if (recognitionRef.current && isActiveRef.current) {
-                try {
-                  recognitionRef.current.start();
-                } catch (e) {
-                  console.log('Recognition already running');
-                }
-              }
-            }, 100);
-          }
-        };
-
-        audio.onerror = () => {
-          audioRef.current = null;
-          // Always restart listening even if audio fails
-          if (isActiveRef.current) {
-            setIsListening(true);
-            setTimeout(() => {
-              if (recognitionRef.current && isActiveRef.current) {
-                try {
-                  recognitionRef.current.start();
-                } catch (e) {
-                  console.log('Recognition already running');
-                }
-              }
-            }, 100);
-          }
-        };
-
-        audio.onpause = () => {
-          // Don't clear audioRef on pause - we might resume it
-        };
-
-        audio.play().catch(() => {
-          audioRef.current = null;
-          // Always restart listening even if play fails
-          if (isActiveRef.current) {
-            setIsListening(true);
-            setTimeout(() => {
-              if (recognitionRef.current && isActiveRef.current) {
-                try {
-                  recognitionRef.current.start();
-                } catch (e) {
-                  console.log('Recognition already running');
-                }
-              }
-            }, 100);
-          }
-        });
-      } else {
-        // No audio, but always keep listening
-        if (isActiveRef.current) {
-          setIsListening(true);
-          setTimeout(() => {
-            if (recognitionRef.current && isActiveRef.current) {
-              try {
-                recognitionRef.current.start();
-              } catch (e) {
-                console.log('Recognition already running');
-              }
-            }
-          }, 100);
-        }
       }
     } catch (error) {
       console.error('Error in chat:', error);
-      alert('Failed to get AI response');
+      // If we hit rate limits, wait briefly then retry legacy once.
+      // Fallback to legacy endpoint so user always gets a response.
+      try {
+        const response = await axios.post(`${API_BASE_URL}/conversation/chat`, {
+          message: userMessage,
+          conversationId: conversationId,
+          agentId: id
+        });
+        const aiResponse = response.data.text;
+        const audioUrl = response.data.audioUrl;
+        const shouldEndCallLegacy = response.data.shouldEndCall || false;
+        if (aiResponse) {
+          setMessages(prev => [...prev, { role: 'assistant', content: aiResponse }]);
+        }
+        setAssistantDraft('');
+
+        if (shouldEndCallLegacy) {
+          await stopConversation();
+          return;
+        }
+
+        if (audioUrl && isActiveRef.current) {
+          enqueueAssistantAudio(audioUrl);
+        }
+      } catch (fallbackErr) {
+        console.error('Legacy fallback failed:', fallbackErr);
+        alert('Failed to get AI response');
+      }
       // Don't use stopAudioAndResumeListening here - it might have conditions
       // Just ensure listening restarts
       if (isActiveRef.current) {
@@ -565,6 +815,10 @@ function AgentDetail() {
       };
       recognitionRef.current.lang = langMap[langCode] || 'en-US';
 
+      recognitionRef.current.onstart = () => {
+        recognitionRunningRef.current = true;
+      };
+
       recognitionRef.current.onresult = async (event) => {
         let interim = '';
         let final = '';
@@ -580,6 +834,68 @@ function AgentDetail() {
 
         if (interim) {
           setInterimTranscript(interim);
+          // Start utterance timer for latency measurement
+          if (utteranceStartPerfRef.current == null) {
+            utteranceStartPerfRef.current = performance.now();
+          }
+          // Prefetch draft (text only) with debounce + cancellation
+          if (conversationId && isActiveRef.current && !isProcessingRef.current) {
+            // Do not prefetch if we're in cooldown (rate limited)
+            if (Date.now() < prefetchCooldownUntilRef.current) {
+              return;
+            }
+            // Throttle: at most once every 800ms, and only if text changes meaningfully
+            const nowMs = Date.now();
+            const lastAt = prefetchLastAtRef.current || 0;
+            const lastText = prefetchLastTextRef.current || '';
+            const newText = interim;
+            const deltaLen = Math.abs(newText.length - lastText.length);
+            if (nowMs - lastAt < 800 && deltaLen < 8) {
+              return;
+            }
+            if (prefetchDebounceTimeoutRef.current) {
+              clearTimeout(prefetchDebounceTimeoutRef.current);
+            }
+            prefetchDebounceTimeoutRef.current = setTimeout(() => {
+              // Abort previous prefetch
+              if (prefetchAbortRef.current) {
+                try {
+                  prefetchAbortRef.current.abort();
+                } catch (e) {}
+              }
+              const ac = new AbortController();
+              prefetchAbortRef.current = ac;
+              prefetchLastAtRef.current = Date.now();
+              prefetchLastTextRef.current = newText;
+              let draft = '';
+              streamNdjson({
+                url: `${API_BASE_URL}/conversation/prefetch`,
+                body: { conversationId, draftText: interim },
+                signal: ac.signal,
+                onEvent: (evt) => {
+                  if (!evt || !evt.type) return;
+                  if (evt.type === 'assistant_delta') {
+                    draft += evt.delta || '';
+                    // Keep prefetch hidden; user wants to see assistant only after they finish speaking.
+                    prefetchHiddenTextRef.current = draft;
+                  }
+                  if (evt.type === 'latency') {
+                    setLatencyInfo(evt.latency || null);
+                  }
+                  if (evt.type === 'rate_limited') {
+                    // Back off for a bit to avoid spamming OpenAI
+                    const retry = Number(evt.retryAfterMs) || 6000;
+                    prefetchCooldownUntilRef.current = Date.now() + Math.min(30000, retry + 500);
+                    try {
+                      ac.abort();
+                    } catch (e) {}
+                  }
+                }
+              }).catch(() => {
+                // ignore prefetch errors
+              });
+            }, 200);
+          }
         }
 
         // Handle interruption with cutting phrase
@@ -594,14 +910,16 @@ function AgentDetail() {
             resumeTimeoutRef.current = null;
           }
           
-          // Save current audio state for potential resume (only if main audio is playing)
-          if (isMainAudioPlaying) {
+          // If we're playing chunked TTS, don't attempt resume; just stop and clear the queue.
+          if (audioRef.current && audioRef.current._isChunkedTts) {
+            stopAssistantAudioQueue();
+            setPausedAudioState(null);
+          } else if (isMainAudioPlaying) {
+            // Legacy single-file behavior: save state to potentially resume
             const currentTime = audioRef.current.currentTime;
             const audioUrl = audioRef.current.src;
             setPausedAudioState({ currentTime, audioUrl });
-            
-            // Pause the main audio
-          audioRef.current.pause();
+            audioRef.current.pause();
           }
           
           // Generate and play cutting phrase
@@ -642,6 +960,16 @@ function AgentDetail() {
 
         if (final.trim()) {
           setInterimTranscript('');
+          // Stop speculative draft and measure ASR latency for this utterance
+          stopPrefetch();
+          const now = performance.now();
+          const start = utteranceStartPerfRef.current ?? now;
+          lastFinalClientTimingsRef.current = {
+            asr_final_ms: Math.round(now - start)
+          };
+          utteranceStartPerfRef.current = null;
+          // Clear hidden prefetch; from here we will display real assistant output
+          prefetchHiddenTextRef.current = '';
           
           // Clear any pending debounce timeout
           if (messageDebounceTimeoutRef.current) {
@@ -683,7 +1011,20 @@ function AgentDetail() {
       };
 
       recognitionRef.current.onerror = (event) => {
-        console.error('Speech recognition error:', event.error);
+        // 'aborted' happens a lot when stop()/start() is called quickly.
+        // Treat it as non-fatal and avoid clearing UI state.
+        if (event.error === 'aborted') {
+          recognitionRunningRef.current = false;
+          return;
+        }
+
+        if (event.error === 'no-speech') {
+          // Normal when the user pauses; keep console clean.
+          recognitionRunningRef.current = false;
+        } else {
+          console.error('Speech recognition error:', event.error);
+        }
+        recognitionRunningRef.current = false;
         setIsListening(false);
         setInterimTranscript('');
         
@@ -692,7 +1033,7 @@ function AgentDetail() {
             setTimeout(() => {
               if (recognitionRef.current && isActiveRef.current && !isProcessingRef.current) {
                 try {
-                  recognitionRef.current.start();
+                  safeStartRecognition();
                 } catch (e) {}
               }
             }, 500);
@@ -701,6 +1042,7 @@ function AgentDetail() {
       };
 
       recognitionRef.current.onend = () => {
+        recognitionRunningRef.current = false;
         // If audio was interrupted and user stopped speaking, resume it
         if (wasInterruptedRef.current && pausedAudioState && !isProcessingRef.current) {
           // Wait a bit to see if user starts speaking again
@@ -719,7 +1061,7 @@ function AgentDetail() {
           setTimeout(() => {
                     if (recognitionRef.current && isActiveRef.current && !isProcessingRef.current) {
               try {
-                recognitionRef.current.start();
+                safeStartRecognition();
               } catch (e) {}
                     }
                   }, 100);
@@ -733,7 +1075,7 @@ function AgentDetail() {
                   setTimeout(() => {
                     if (recognitionRef.current && isActiveRef.current && !isProcessingRef.current) {
                       try {
-                        recognitionRef.current.start();
+                        safeStartRecognition();
                       } catch (e) {}
                     }
                   }, 100);
@@ -751,7 +1093,7 @@ function AgentDetail() {
                   setTimeout(() => {
                     if (recognitionRef.current && isActiveRef.current && !isProcessingRef.current) {
                       try {
-                        recognitionRef.current.start();
+                        safeStartRecognition();
                       } catch (e) {}
                     }
                   }, 100);
@@ -769,7 +1111,7 @@ function AgentDetail() {
           setTimeout(() => {
             if (recognitionRef.current && isActiveRef.current) {
               try {
-                recognitionRef.current.start();
+                safeStartRecognition();
               } catch (e) {
                 // Recognition might already be running, that's okay
                 console.log('Recognition already running in onend');
@@ -779,158 +1121,10 @@ function AgentDetail() {
         }
       };
     }
-  }, [isListening, handleUserMessage]);
+  }, [isListening, handleUserMessage, safeStartRecognition]);
 
   const startConversation = async () => {
-    if (!systemPrompt.trim()) {
-      alert('Please enter a system prompt for the agent');
-      return;
-    }
-
-    try {
-      isProcessingRef.current = true;
-      setIsProcessing(true);
-      
-      const response = await axios.post(`${API_BASE_URL}/conversation/start`, {
-        systemPrompt: systemPrompt.trim(),
-        agentId: id,
-        knowledgeBaseId: selectedKB || null,
-        aiSpeaksFirst: callSettings.aiSpeaksFirst || false
-      });
-
-      setConversationId(response.data.conversationId);
-      setIsActive(true);
-      isActiveRef.current = true;
-      setMessages([]);
-      setInterimTranscript('');
-
-      isProcessingRef.current = false;
-      setIsProcessing(false);
-
-      // If AI should speak first, play the initial greeting
-      if (callSettings.aiSpeaksFirst && response.data.initialGreeting) {
-        setMessages(prev => [...prev, { role: 'assistant', content: response.data.initialGreeting }]);
-
-        if (response.data.initialAudioUrl && isActiveRef.current) {
-          // Audio URL is now /api/audio/{fileId} from MongoDB GridFS
-          const audioUrl = response.data.initialAudioUrl.startsWith('http') 
-            ? response.data.initialAudioUrl 
-            : `${BACKEND_URL}${response.data.initialAudioUrl}`;
-          const audio = new Audio(audioUrl);
-          audioRef.current = audio;
-
-          audio.onended = () => {
-            audioRef.current = null;
-            if (isActiveRef.current && !isProcessingRef.current) {
-      setIsListening(true);
-              setTimeout(() => {
-                if (recognitionRef.current && isActiveRef.current && !isProcessingRef.current) {
-                  try {
-                    recognitionRef.current.start();
-                  } catch (e) {}
-                }
-              }, 100);
-            }
-          };
-
-          audio.onerror = () => {
-            audioRef.current = null;
-            if (isActiveRef.current && !isProcessingRef.current) {
-              setIsListening(true);
-              setTimeout(() => {
-                if (recognitionRef.current && isActiveRef.current && !isProcessingRef.current) {
-                  try {
-                    recognitionRef.current.start();
-                  } catch (e) {}
-                }
-              }, 100);
-            }
-          };
-
-          audio.onpause = () => {
-            // Don't clear audioRef on pause
-          };
-
-          audio.play().catch(() => {
-            audioRef.current = null;
-            if (isActiveRef.current && !isProcessingRef.current) {
-              setIsListening(true);
-              setTimeout(() => {
-                if (recognitionRef.current && isActiveRef.current && !isProcessingRef.current) {
-                  try {
-                    recognitionRef.current.start();
-                  } catch (e) {}
-                }
-              }, 100);
-            }
-          });
-        } else {
-          setIsListening(true);
-          setTimeout(() => {
-            if (recognitionRef.current && isActiveRef.current && !isProcessingRef.current) {
-              try {
-                recognitionRef.current.start();
-              } catch (e) {}
-            }
-          }, 100);
-        }
-      } else {
-        // User starts first - just start listening
-        setIsListening(true);
-      
-      setTimeout(() => {
-        if (recognitionRef.current && isActiveRef.current) {
-          try {
-            recognitionRef.current.start();
-          } catch (e) {}
-        }
-      }, 300);
-      }
-    } catch (error) {
-      console.error('Error starting conversation:', error);
-      alert('Failed to start conversation');
-      isProcessingRef.current = false;
-      setIsProcessing(false);
-    }
-  };
-
-  const stopConversation = async () => {
-    isActiveRef.current = false;
-    isProcessingRef.current = false;
-    setIsActive(false);
-    setIsListening(false);
-    setIsProcessing(false);
-    setInterimTranscript('');
-    if (recognitionRef.current) {
-      try {
-        recognitionRef.current.stop();
-      } catch (e) {}
-    }
-    if (audioRef.current) {
-      audioRef.current.pause();
-      audioRef.current = null;
-    }
-    if (cuttingAudioRef.current) {
-      cuttingAudioRef.current.pause();
-      cuttingAudioRef.current = null;
-    }
-    setPausedAudioState(null);
-    wasInterruptedRef.current = false;
-    if (resumeTimeoutRef.current) {
-      clearTimeout(resumeTimeoutRef.current);
-      resumeTimeoutRef.current = null;
-    }
-
-    // End the call and save to history
-    if (conversationId) {
-      try {
-        await axios.post(`${API_BASE_URL}/conversation/${conversationId}/end`, {
-          endReason: 'user_hangup'
-        });
-      } catch (error) {
-        console.error('Error ending call:', error);
-      }
-    }
+    return startConversationLegacy();
   };
 
   if (!agent) {
@@ -1374,6 +1568,26 @@ function AgentDetail() {
                         </motion.div>
                       ))}
                     </AnimatePresence>
+
+                    {/* Show assistant text only after user finished speaking (no interim visible) */}
+                    {assistantDraft && !interimTranscript && (
+                      <motion.div
+                        initial={{ opacity: 0 }}
+                        animate={{ opacity: 1 }}
+                        className="message assistant draft"
+                      >
+                        <div className="message-content">
+                          {assistantDraft}
+                          <span className="typing-cursor">|</span>
+                          {latencyInfo?.llmFirstTokenMs != null && (
+                            <div style={{ fontSize: '12px', opacity: 0.7, marginTop: '6px' }}>
+                              LLM first token: {latencyInfo.llmFirstTokenMs}ms
+                              {latencyInfo.ttsFirstAudioMs != null ? ` • TTS first audio: ${latencyInfo.ttsFirstAudioMs}ms` : ''}
+                            </div>
+                          )}
+                        </div>
+                      </motion.div>
+                    )}
 
                     {interimTranscript && (
                       <motion.div

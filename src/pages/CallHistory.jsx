@@ -57,6 +57,21 @@ function CallHistory() {
     });
   };
 
+  const formatMs = (ms) => {
+    if (ms == null) return '—';
+    const n = Number(ms);
+    if (!Number.isFinite(n)) return '—';
+    return `${Math.round(n)}ms`;
+  };
+
+  const avgLatencyMs = (() => {
+    const vals = (calls || [])
+      .map(c => c?.latencySummary?.avgE2eFirstAudioMs ?? c?.latencySummary?.lastTurn?.e2eFirstAudioMs)
+      .filter(v => typeof v === 'number' && Number.isFinite(v));
+    if (!vals.length) return null;
+    return Math.round(vals.reduce((a, b) => a + b, 0) / vals.length);
+  })();
+
   const getEndReasonColor = (reason) => {
     if (reason === 'user_hangup' || reason === 'agent_hangup') return '#10b981';
     return '#6b7280';
@@ -81,6 +96,9 @@ function CallHistory() {
       <div className="call-history-header">
         <h1 className="call-history-title">Call History</h1>
         <div className="call-history-actions">
+          <div style={{ fontSize: '12px', opacity: 0.75, marginRight: '10px' }}>
+            Avg latency: <strong>{formatMs(avgLatencyMs)}</strong>
+          </div>
           <button className="btn-secondary" onClick={fetchCallHistory}>
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
               <polyline points="23 4 23 10 17 10"></polyline>
@@ -100,6 +118,7 @@ function CallHistory() {
               <th>Duration</th>
               <th>Channel Type</th>
               <th>Cost</th>
+              <th>Latency</th>
               <th>Session ID</th>
               <th>End Reason</th>
               <th>Session Status</th>
@@ -132,6 +151,7 @@ function CallHistory() {
                     <span className="channel-badge">{call.channelType || 'web_call'}</span>
                   </td>
                   <td>${call.cost.toFixed(3)}</td>
+                  <td>{formatMs(call.latencySummary?.avgE2eFirstAudioMs ?? call.latencySummary?.lastTurn?.e2eFirstAudioMs)}</td>
                   <td>
                     <span className="session-id">{call.id.substring(0, 20)}...</span>
                   </td>
@@ -238,6 +258,20 @@ function CallHistory() {
                         style={{ backgroundColor: getEndReasonColor(selectedCall.endReason) }}
                       ></span>
                       <span>{selectedCall.endReason || 'N/A'}</span>
+                    </div>
+                  </div>
+                  <div className="analysis-item">
+                    <span className="analysis-label">Avg Latency (first audio)</span>
+                    <div className="analysis-value">
+                      <span>{formatMs(selectedCall.latencySummary?.avgE2eFirstAudioMs)}</span>
+                    </div>
+                  </div>
+                  <div className="analysis-item">
+                    <span className="analysis-label">Last Turn Latency</span>
+                    <div className="analysis-value">
+                      <span>
+                        {formatMs(selectedCall.latencySummary?.lastTurn?.e2eFirstAudioMs)}
+                      </span>
                     </div>
                   </div>
                 </div>
