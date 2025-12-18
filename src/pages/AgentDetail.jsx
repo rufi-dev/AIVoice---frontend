@@ -220,6 +220,19 @@ function AgentDetail() {
 
   const stopAssistantAudioQueue = useCallback(() => {
     audioSessionRef.current += 1;
+    // Stop and release any queued audio elements
+    try {
+      for (const item of audioQueueRef.current || []) {
+        if (item && typeof item.pause === 'function') {
+          try {
+            item.pause();
+            item.currentTime = 0;
+            item.src = '';
+            item.load?.();
+          } catch (e) {}
+        }
+      }
+    } catch (e) {}
     audioQueueRef.current = [];
     isPlayingQueueRef.current = false;
     if (audioRef.current) {
@@ -283,13 +296,25 @@ function AgentDetail() {
     if (!next) return;
     isPlayingQueueRef.current = true;
 
-    const fullUrl = toBackendAbsoluteUrl(next);
-    if (!fullUrl) {
+    // We enqueue Audio objects already preloaded to avoid gaps between chunks.
+    const audio =
+      next && typeof next.play === 'function'
+        ? next
+        : (() => {
+            const fullUrl = toBackendAbsoluteUrl(next);
+            if (!fullUrl) return null;
+            const a = new Audio(fullUrl);
+            a.preload = 'auto';
+            try {
+              a.load();
+            } catch (e) {}
+            return a;
+          })();
+    if (!audio) {
       isPlayingQueueRef.current = false;
       setTimeout(() => playNextQueuedAudio(), 0);
       return;
     }
-    const audio = new Audio(fullUrl);
     // Mark this as chunked so interruption logic can treat it differently
     audio._isChunkedTts = true;
     audioRef.current = audio;
@@ -321,7 +346,21 @@ function AgentDetail() {
 
   const enqueueAssistantAudio = useCallback((audioUrl) => {
     if (!audioUrl) return;
-    audioQueueRef.current.push(audioUrl);
+    // Pre-create + preload the audio element immediately so the next chunk has no startup gap.
+    const fullUrl = toBackendAbsoluteUrl(audioUrl);
+    const audio = fullUrl ? new Audio(fullUrl) : null;
+    if (audio) {
+      audio.preload = 'auto';
+      // Mark as chunked
+      audio._isChunkedTts = true;
+      try {
+        audio.load();
+      } catch (e) {}
+      audioQueueRef.current.push(audio);
+    } else {
+      // fallback
+      audioQueueRef.current.push(audioUrl);
+    }
     // Start if idle
     if (!isPlayingQueueRef.current) {
       playNextQueuedAudio();
@@ -1284,14 +1323,38 @@ function AgentDetail() {
     return `${Math.round(range.min)}–${Math.round(range.max)}ms`;
   };
 
+  const fmtMs = (n) => {
+    if (typeof n !== 'number' || !Number.isFinite(n)) return '—';
+    return `${Math.round(n)}ms`;
+  };
+
   const fmtTokensRange = (range) => {
     if (!range || typeof range.min !== 'number' || typeof range.max !== 'number') return '—';
     return `${Math.round(range.min)}–${Math.round(range.max)} tokens`;
   };
 
+  const fmtTokens = (n) => {
+    if (typeof n !== 'number' || !Number.isFinite(n)) return '—';
+    return `${Math.round(n)} tokens`;
+  };
+
   const fmtUsdPerMin = (n) => {
     if (typeof n !== 'number' || !Number.isFinite(n)) return '—';
     return `$${n.toFixed(2)}/min`;
+  };
+
+  const copyAgentId = async () => {
+    try {
+      await navigator.clipboard.writeText(String(id || ''));
+    } catch (e) {
+      // Fallback for some browsers
+      const ta = document.createElement('textarea');
+      ta.value = String(id || '');
+      document.body.appendChild(ta);
+      ta.select();
+      try { document.execCommand('copy'); } catch {}
+      document.body.removeChild(ta);
+    }
   };
 
   return (
@@ -1380,20 +1443,33 @@ function AgentDetail() {
               marginTop: '0.25rem'
             }}>
               <span style={{ opacity: 0.75 }}>Agent ID:</span>
-              <strong>{shortId(id, 6)}</strong>
+              <strong style={{ display: 'inline-flex', alignItems: 'center', gap: '0.35rem' }}>
+                {shortId(id, 6)}
+                <button
+                  className="btn-secondary"
+                  onClick={copyAgentId}
+                  title="Copy Agent ID"
+                  style={{ padding: '0.25rem 0.4rem', minWidth: 'auto', fontSize: '0.75rem' }}
+                >
+                  Copy
+                </button>
+              </strong>
 
               <span style={{ opacity: 0.5 }}>•</span>
               <span style={{ opacity: 0.75 }}>LLM:</span>
               <strong>{callStats?.llmModel || speechSettings.openaiModel || '—'}</strong>
 
               <span style={{ opacity: 0.5 }}>•</span>
+              <span style={{ opacity: 0.75 }}>Cost/min:</span>
               <strong>{fmtUsdPerMin(callStats?.costPerMin)}</strong>
 
               <span style={{ opacity: 0.5 }}>•</span>
-              <strong>{fmtMsRange(callStats?.latencyRangeMs)}</strong>
+              <span style={{ opacity: 0.75 }}>Latency:</span>
+              <strong>{fmtMs(callStats?.avgLatencyMs ?? callStats?.lastTurn?.e2eFirstAudioMs)}</strong>
 
               <span style={{ opacity: 0.5 }}>•</span>
-              <strong>{fmtTokensRange(callStats?.tokensRange)}</strong>
+              <span style={{ opacity: 0.75 }}>Tokens:</span>
+              <strong>{fmtTokens(callStats?.avgTokensUsed ?? callStats?.tokensRange?.max ?? callStats?.lastTurn?.tokensUsed)}</strong>
             </div>
           </div>
         </div>
