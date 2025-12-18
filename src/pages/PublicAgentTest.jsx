@@ -4,7 +4,51 @@ import axios from 'axios';
 import './PublicAgentTest.css';
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:5000/api';
-const BACKEND_URL = import.meta.env.VITE_API_URL?.replace('/api', '') || 'http://localhost:5000';
+
+function getApiOrigin() {
+  try {
+    const origin = new URL(API_BASE_URL).origin;
+    if (origin.includes('localhost') || origin.includes('127.0.0.1')) {
+      throw new Error('Invalid API origin (localhost)');
+    }
+    return origin;
+  } catch (e) {
+    try {
+      const { protocol, hostname } = window.location;
+      if (hostname.startsWith('dashboard.')) {
+        return `${protocol}//api.${hostname.slice('dashboard.'.length)}`;
+      }
+      if (hostname.startsWith('api.')) {
+        return `${protocol}//${hostname}`;
+      }
+      return window.location.origin;
+    } catch {
+      return window.location.origin;
+    }
+  }
+}
+
+function normalizeBackendPath(pathOrUrl) {
+  if (!pathOrUrl) return null;
+  const raw = String(pathOrUrl);
+  if (!raw) return null;
+  if (raw.startsWith('http://') || raw.startsWith('https://')) return raw;
+
+  let p = raw;
+  if (p.startsWith('/.rapidcallai.com/')) {
+    p = p.replace('/.rapidcallai.com', '');
+  }
+  p = p.replace('/api/api/', '/api/');
+  if (!p.startsWith('/')) p = `/${p}`;
+  return p;
+}
+
+function toBackendAbsoluteUrl(pathOrUrl) {
+  const normalized = normalizeBackendPath(pathOrUrl);
+  if (!normalized) return null;
+  if (normalized.startsWith('http://') || normalized.startsWith('https://')) return normalized;
+  return `${getApiOrigin()}${normalized}`;
+}
 
 function PublicAgentTest() {
   const { token } = useParams();
@@ -97,11 +141,8 @@ function PublicAgentTest() {
       }
 
       if (response.data.audioUrl && isActiveRef.current) {
-        const audioUrl = response.data.audioUrl.startsWith('http')
-          ? response.data.audioUrl
-          : `${BACKEND_URL}${response.data.audioUrl}`;
-        
-        const audio = new Audio(audioUrl);
+        const audioUrl = toBackendAbsoluteUrl(response.data.audioUrl);
+        const audio = audioUrl ? new Audio(audioUrl) : null;
         audioRef.current = audio;
 
         // Handle interruption detection - check if user speaks while AI is talking
@@ -145,7 +186,7 @@ function PublicAgentTest() {
           recognitionRef.current.onresult = wrappedHandler;
         }
 
-        audio.onended = () => {
+        audio && (audio.onended = () => {
           audioRef.current = null;
           // Restore original handler
           if (recognitionRef.current && originalRecognitionHandlerRef.current) {
@@ -161,9 +202,9 @@ function PublicAgentTest() {
               }
             }, 100);
           }
-        };
+        });
 
-        audio.onerror = () => {
+        audio && (audio.onerror = () => {
           audioRef.current = null;
           // Restore original handler
           if (recognitionRef.current && originalRecognitionHandlerRef.current) {
@@ -179,20 +220,20 @@ function PublicAgentTest() {
               }
             }, 100);
           }
-        };
+        });
 
         // Handle interruption
-        audio.onplay = () => {
+        audio && (audio.onplay = () => {
           wasInterruptedRef.current = false;
-        };
+        });
 
-        audio.onpause = () => {
+        audio && (audio.onpause = () => {
           if (wasInterruptedRef.current && pausedAudioState) {
             audio.currentTime = pausedAudioState.currentTime;
           }
-        };
+        });
 
-        audio.play().catch(() => {
+        audio?.play().catch(() => {
           audioRef.current = null;
           if (isActiveRef.current && !isProcessingRef.current) {
             setIsListening(true);
@@ -352,13 +393,11 @@ function PublicAgentTest() {
         setMessages(prev => [...prev, { role: 'assistant', content: response.data.initialGreeting }]);
 
         if (response.data.initialAudioUrl && isActiveRef.current) {
-          const audioUrl = response.data.initialAudioUrl.startsWith('http')
-            ? response.data.initialAudioUrl
-            : `${BACKEND_URL}${response.data.initialAudioUrl}`;
-          const audio = new Audio(audioUrl);
+          const audioUrl = toBackendAbsoluteUrl(response.data.initialAudioUrl);
+          const audio = audioUrl ? new Audio(audioUrl) : null;
           audioRef.current = audio;
 
-          audio.onended = () => {
+          audio && (audio.onended = () => {
             audioRef.current = null;
             if (isActiveRef.current && !isProcessingRef.current) {
               setIsListening(true);
@@ -370,9 +409,9 @@ function PublicAgentTest() {
                 }
               }, 100);
             }
-          };
+          });
 
-          audio.play().catch(() => {
+          audio?.play().catch(() => {
             audioRef.current = null;
             if (isActiveRef.current && !isProcessingRef.current) {
               setIsListening(true);
