@@ -158,8 +158,25 @@ function AgentDetail() {
   const isPlayingQueueRef = useRef(false);
   const utteranceStartPerfRef = useRef(null);
   const lastFinalClientTimingsRef = useRef(null);
+  const spokenCharsRef = useRef(0);
   const spokenTextRef = useRef('');
   const fullAssistantTextRef = useRef('');
+  const activeChatAbortRef = useRef(null);
+  const activeTurnIdRef = useRef(0);
+  const abortedByBargeInRef = useRef(false);
+  const audioSessionRef = useRef(0);
+
+  const sanitizeCaptionText = useCallback((input) => {
+    if (!input) return '';
+    let s = String(input);
+    s = s.replace(/```[\s\S]*?```/g, ' ');
+    s = s.replace(/`+/g, '');
+    s = s.replace(/[{}\[\]<>]/g, ' ');
+    s = s.replace(/[*^%$#@|~]/g, ' ');
+    s = s.replace(/[\u0000-\u001F\u007F]/g, ' ');
+    s = s.replace(/\s+/g, ' ');
+    return s;
+  }, []);
 
   // (Streaming/Deepgram removed)
 
@@ -202,15 +219,62 @@ function AgentDetail() {
   }, []);
 
   const stopAssistantAudioQueue = useCallback(() => {
+    audioSessionRef.current += 1;
     audioQueueRef.current = [];
     isPlayingQueueRef.current = false;
     if (audioRef.current) {
       try {
         audioRef.current.pause();
+        audioRef.current.currentTime = 0;
+        // Help browsers stop audio immediately
+        audioRef.current.src = '';
+        audioRef.current.load?.();
       } catch (e) {}
       audioRef.current = null;
     }
   }, []);
+
+  const bargeInStopAgent = useCallback(() => {
+    abortedByBargeInRef.current = true;
+
+    // Stop any "cutting phrase" audio immediately
+    if (cuttingAudioRef.current) {
+      try {
+        cuttingAudioRef.current.pause();
+        cuttingAudioRef.current.currentTime = 0;
+        cuttingAudioRef.current.src = '';
+        cuttingAudioRef.current.load?.();
+      } catch (e) {}
+      cuttingAudioRef.current = null;
+    }
+
+    // Stop all assistant audio
+    stopAssistantAudioQueue();
+
+    // Abort current streaming turn (stops LLM + TTS queue server-side)
+    if (activeChatAbortRef.current) {
+      try {
+        activeChatAbortRef.current.abort();
+      } catch (e) {}
+      activeChatAbortRef.current = null;
+    }
+
+    // Allow next user utterance to be processed even if we were "processing"
+    isProcessingRef.current = false;
+    setIsProcessing(false);
+
+    // Clear live captions/draft so it doesn't keep updating from old turn
+    setAssistantDraft('');
+    spokenTextRef.current = '';
+    spokenCharsRef.current = 0;
+    fullAssistantTextRef.current = '';
+
+    // Keep listening
+    if (isActiveRef.current) {
+      setIsListening(true);
+      safeStartRecognition(0);
+    }
+  }, [safeStartRecognition, stopAssistantAudioQueue]);
 
   const playNextQueuedAudio = useCallback(() => {
     if (!isActiveRef.current) return;
@@ -667,14 +731,19 @@ function AgentDetail() {
     setAssistantDraft('');
     setLatencyInfo(null);
     setCallStats(null);
+    spokenCharsRef.current = 0;
     spokenTextRef.current = '';
     fullAssistantTextRef.current = '';
+    abortedByBargeInRef.current = false;
+
+    const myTurnId = (activeTurnIdRef.current += 1);
 
     setMessages(prev => [...prev, { role: 'user', content: userMessage }]);
 
     try {
       // Stream response + early chunked TTS
       const ac = new AbortController();
+      activeChatAbortRef.current = ac;
       // If user starts speaking again, we can cancel by calling stopPrefetch/stopAssistantAudioQueue, but chat stream is per-turn.
 
       let fullAssistantText = '';
@@ -698,25 +767,24 @@ function AgentDetail() {
         },
         signal: ac.signal,
         onEvent: (evt) => {
+          // Ignore late events from a cancelled/previous turn
+          if (myTurnId !== activeTurnIdRef.current) return;
           if (!evt || !evt.type) return;
           receivedAny = true;
           if (evt.type === 'assistant_delta') {
             fullAssistantText += evt.delta || '';
             fullAssistantTextRef.current = fullAssistantText;
-            const spoken = spokenTextRef.current || '';
-            const visible = spoken && fullAssistantText.startsWith(spoken)
-              ? fullAssistantText.slice(spoken.length)
-              : fullAssistantText;
-            setAssistantDraft(visible.trimStart());
+            // Don't show the full LLM text ahead of audio.
+            // We only show captions from tts_audio chunks (what is actually being spoken).
           }
           if (evt.type === 'tts_audio' && evt.audioUrl) {
-            if (typeof evt.text === 'string' && evt.text.trim()) {
-              spokenTextRef.current = (spokenTextRef.current || '') + evt.text;
-              const spoken = spokenTextRef.current || '';
-              const full = fullAssistantTextRef.current || fullAssistantText || '';
-              if (full && spoken && full.startsWith(spoken)) {
-                setAssistantDraft(full.slice(spoken.length).trimStart());
-              }
+            if (typeof evt.spokenUpTo === 'number' && Number.isFinite(evt.spokenUpTo)) {
+              spokenCharsRef.current = evt.spokenUpTo;
+            }
+            if (typeof evt.text === 'string' && evt.text) {
+              // Grow captions steadily based on the actual queued chunk text (Retell-like).
+              spokenTextRef.current = (spokenTextRef.current || '') + sanitizeCaptionText(evt.text);
+              setAssistantDraft(spokenTextRef.current.trimStart());
             }
             enqueueAssistantAudio(evt.audioUrl);
           }
@@ -733,17 +801,14 @@ function AgentDetail() {
             if (typeof evt.text === 'string') {
               fullAssistantText = evt.text;
               fullAssistantTextRef.current = fullAssistantText;
-              const spoken = spokenTextRef.current || '';
-              const visible = spoken && fullAssistantText.startsWith(spoken)
-                ? fullAssistantText.slice(spoken.length)
-                : fullAssistantText;
-              setAssistantDraft(visible.trimStart());
+              // Keep captions as-is; final transcript is committed after stream ends.
             }
             shouldEndCall = !!evt.shouldEndCall;
           }
         }
       });
       clearTimeout(stallTimer);
+      if (activeChatAbortRef.current === ac) activeChatAbortRef.current = null;
 
       // Always show the response - the interruption flag was just for tracking
       // Reset the interruption flag after we get the response
@@ -788,8 +853,11 @@ function AgentDetail() {
         }, 100);
       }
     } catch (error) {
+      // If we aborted due to barge-in, do NOT fallback (it causes double voices).
+      if (abortedByBargeInRef.current || error?.name === 'AbortError') {
+        return;
+      }
       console.error('Error in chat:', error);
-      // If we hit rate limits, wait briefly then retry legacy once.
       // Fallback to legacy endpoint so user always gets a response.
       try {
         const response = await axios.post(`${API_BASE_URL}/conversation/chat`, {
@@ -832,8 +900,11 @@ function AgentDetail() {
         }, 100);
       }
     } finally {
-      isProcessingRef.current = false;
-      setIsProcessing(false);
+      // Only clear processing if this turn is still the active one
+      if (myTurnId === activeTurnIdRef.current) {
+        isProcessingRef.current = false;
+        setIsProcessing(false);
+      }
       isInterruptingRef.current = false;
       
       // Always ensure listening is active after processing completes
@@ -984,53 +1055,19 @@ function AgentDetail() {
           }
         }
 
-        // Handle interruption with cutting phrase
+        // Barge-in: if user starts speaking while agent is speaking OR thinking,
+        // immediately stop audio + abort stream and listen to the user.
         const isMainAudioPlaying = audioRef.current && audioRef.current.currentTime > 0;
-        
-        if (interim && isMainAudioPlaying && !wasInterruptedRef.current) {
+        const isAgentBusy = isProcessingRef.current || isMainAudioPlaying;
+        if (interim && isAgentBusy && !wasInterruptedRef.current) {
           wasInterruptedRef.current = true;
-          
           // Clear any existing resume timeout
           if (resumeTimeoutRef.current) {
             clearTimeout(resumeTimeoutRef.current);
             resumeTimeoutRef.current = null;
           }
-          
-          // If we're playing chunked TTS, don't attempt resume; just stop and clear the queue.
-          if (audioRef.current && audioRef.current._isChunkedTts) {
-            stopAssistantAudioQueue();
-            setPausedAudioState(null);
-          } else if (isMainAudioPlaying) {
-            // Legacy single-file behavior: save state to potentially resume
-            const currentTime = audioRef.current.currentTime;
-            const audioUrl = audioRef.current.src;
-            setPausedAudioState({ currentTime, audioUrl });
-            audioRef.current.pause();
-          }
-          
-          // Generate and play cutting phrase
-          try {
-            const cuttingResponse = await axios.post(`${API_BASE_URL}/conversation/cutting-phrase`, {
-              conversationId: conversationId,
-              agentId: id
-            });
-            
-            if (cuttingResponse.data.audioUrl && isActiveRef.current) {
-              const cuttingAudioUrl = toBackendAbsoluteUrl(cuttingResponse.data.audioUrl);
-              const cuttingAudio = cuttingAudioUrl ? new Audio(cuttingAudioUrl) : null;
-              cuttingAudioRef.current = cuttingAudio;
-              
-              cuttingAudio.onended = () => {
-                cuttingAudioRef.current = null;
-              };
-              
-              cuttingAudio?.play().catch(() => {
-                cuttingAudioRef.current = null;
-              });
-            }
-          } catch (error) {
-            console.error('Error generating cutting phrase:', error);
-          }
+          setPausedAudioState(null);
+          bargeInStopAgent();
         }
 
         // Clear resume timeout when user is speaking
