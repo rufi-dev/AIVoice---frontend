@@ -107,6 +107,7 @@ function AgentDetail() {
   const [interimTranscript, setInterimTranscript] = useState('');
   const [assistantDraft, setAssistantDraft] = useState('');
   const [latencyInfo, setLatencyInfo] = useState(null);
+  const [callStats, setCallStats] = useState(null);
   const [pausedAudioState, setPausedAudioState] = useState(null);
   const [knowledgeBases, setKnowledgeBases] = useState([]);
   const [selectedKB, setSelectedKB] = useState('');
@@ -157,6 +158,8 @@ function AgentDetail() {
   const isPlayingQueueRef = useRef(false);
   const utteranceStartPerfRef = useRef(null);
   const lastFinalClientTimingsRef = useRef(null);
+  const spokenTextRef = useRef('');
+  const fullAssistantTextRef = useRef('');
 
   // (Streaming/Deepgram removed)
 
@@ -663,6 +666,9 @@ function AgentDetail() {
     stopAssistantAudioQueue();
     setAssistantDraft('');
     setLatencyInfo(null);
+    setCallStats(null);
+    spokenTextRef.current = '';
+    fullAssistantTextRef.current = '';
 
     setMessages(prev => [...prev, { role: 'user', content: userMessage }]);
 
@@ -696,9 +702,22 @@ function AgentDetail() {
           receivedAny = true;
           if (evt.type === 'assistant_delta') {
             fullAssistantText += evt.delta || '';
-            setAssistantDraft(fullAssistantText);
+            fullAssistantTextRef.current = fullAssistantText;
+            const spoken = spokenTextRef.current || '';
+            const visible = spoken && fullAssistantText.startsWith(spoken)
+              ? fullAssistantText.slice(spoken.length)
+              : fullAssistantText;
+            setAssistantDraft(visible.trimStart());
           }
           if (evt.type === 'tts_audio' && evt.audioUrl) {
+            if (typeof evt.text === 'string' && evt.text.trim()) {
+              spokenTextRef.current = (spokenTextRef.current || '') + evt.text;
+              const spoken = spokenTextRef.current || '';
+              const full = fullAssistantTextRef.current || fullAssistantText || '';
+              if (full && spoken && full.startsWith(spoken)) {
+                setAssistantDraft(full.slice(spoken.length).trimStart());
+              }
+            }
             enqueueAssistantAudio(evt.audioUrl);
           }
           if (evt.type === 'latency') {
@@ -713,7 +732,12 @@ function AgentDetail() {
           if (evt.type === 'final') {
             if (typeof evt.text === 'string') {
               fullAssistantText = evt.text;
-              setAssistantDraft(evt.text);
+              fullAssistantTextRef.current = fullAssistantText;
+              const spoken = spokenTextRef.current || '';
+              const visible = spoken && fullAssistantText.startsWith(spoken)
+                ? fullAssistantText.slice(spoken.length)
+                : fullAssistantText;
+              setAssistantDraft(visible.trimStart());
             }
             shouldEndCall = !!evt.shouldEndCall;
           }
@@ -1182,6 +1206,28 @@ function AgentDetail() {
     }
   }, [isListening, handleUserMessage, safeStartRecognition]);
 
+  // Poll live call stats (Retell-like header)
+  useEffect(() => {
+    if (!isActive || !conversationId) return;
+    let cancelled = false;
+
+    const fetchStats = async () => {
+      try {
+        const resp = await axios.get(`${API_BASE_URL}/call-history/by-conversation/${conversationId}`);
+        if (!cancelled) setCallStats(resp.data);
+      } catch (e) {
+        // ignore
+      }
+    };
+
+    fetchStats();
+    const interval = setInterval(fetchStats, 3000);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [isActive, conversationId]);
+
   const startConversation = async () => {
     return startConversationLegacy();
   };
@@ -1189,6 +1235,27 @@ function AgentDetail() {
   if (!agent) {
     return <div className="agent-detail-loading">Loading...</div>;
   }
+
+  const shortId = (value, n = 6) => {
+    const s = String(value || '');
+    if (!s) return '';
+    return s.length <= n * 2 ? s : `${s.slice(0, n)}…${s.slice(-n)}`;
+  };
+
+  const fmtMsRange = (range) => {
+    if (!range || typeof range.min !== 'number' || typeof range.max !== 'number') return '—';
+    return `${Math.round(range.min)}–${Math.round(range.max)}ms`;
+  };
+
+  const fmtTokensRange = (range) => {
+    if (!range || typeof range.min !== 'number' || typeof range.max !== 'number') return '—';
+    return `${Math.round(range.min)}–${Math.round(range.max)} tokens`;
+  };
+
+  const fmtUsdPerMin = (n) => {
+    if (typeof n !== 'number' || !Number.isFinite(n)) return '—';
+    return `$${n.toFixed(2)}/min`;
+  };
 
   return (
     <div className="agent-detail-container">
@@ -1265,6 +1332,32 @@ function AgentDetail() {
                 </button>
               </div>
             )}
+
+            {/* Retell-style live stats strip */}
+            <div style={{
+              display: 'flex',
+              flexWrap: 'wrap',
+              gap: '0.5rem',
+              fontSize: '0.875rem',
+              color: '#111827',
+              marginTop: '0.25rem'
+            }}>
+              <span style={{ opacity: 0.75 }}>Agent ID:</span>
+              <strong>{shortId(id, 6)}</strong>
+
+              <span style={{ opacity: 0.5 }}>•</span>
+              <span style={{ opacity: 0.75 }}>LLM:</span>
+              <strong>{callStats?.llmModel || speechSettings.openaiModel || '—'}</strong>
+
+              <span style={{ opacity: 0.5 }}>•</span>
+              <strong>{fmtUsdPerMin(callStats?.costPerMin)}</strong>
+
+              <span style={{ opacity: 0.5 }}>•</span>
+              <strong>{fmtMsRange(callStats?.latencyRangeMs)}</strong>
+
+              <span style={{ opacity: 0.5 }}>•</span>
+              <strong>{fmtTokensRange(callStats?.tokensRange)}</strong>
+            </div>
           </div>
         </div>
         <div className="agent-detail-actions">
