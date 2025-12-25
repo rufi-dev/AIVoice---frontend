@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { useParams } from 'react-router-dom';
 import axios from 'axios';
+import { Room, RoomEvent, createLocalAudioTrack } from 'livekit-client';
 import './PublicAgentTest.css';
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:5000/api';
@@ -62,18 +63,28 @@ function PublicAgentTest() {
   const [isProcessing, setIsProcessing] = useState(false);
   const [interimTranscript, setInterimTranscript] = useState('');
   const [pausedAudioState, setPausedAudioState] = useState(null);
+  const [realtimeState, setRealtimeState] = useState({
+    status: 'idle',
+    roomName: null,
+    identity: null,
+    callId: null,
+    error: null,
+    userSpeaking: false,
+    agentSpeaking: false
+  });
+  const [isConnecting, setIsConnecting] = useState(false);
+  const [livekitStats, setLivekitStats] = useState({ rtt: null, e2e: null });
   
   const audioRef = useRef(null);
   const cuttingAudioRef = useRef(null);
-  const recognitionRef = useRef(null);
+  const lkRoomRef = useRef(null);
+  const lkMicTrackRef = useRef(null);
+  const lkAudioContainerRef = useRef(null);
+  const lkLastTurnRef = useRef({ turnId: null, vadEndAt: null });
+  const lkSentPlayoutRef = useRef(new Set());
+  const lkConfigAckRef = useRef(false);
   const isProcessingRef = useRef(false);
-  const pendingMessageRef = useRef(null);
-  const messageDebounceTimeoutRef = useRef(null);
   const isActiveRef = useRef(false);
-  const wasInterruptedRef = useRef(false);
-  const resumeTimeoutRef = useRef(null);
-  const isInterruptingRef = useRef(false);
-  const originalRecognitionHandlerRef = useRef(null); // Store original recognition handler
 
   useEffect(() => {
     if (token) {
@@ -84,6 +95,7 @@ function PublicAgentTest() {
   useEffect(() => {
     isActiveRef.current = isActive;
   }, [isActive]);
+
 
   const fetchAgent = async () => {
     try {
@@ -99,379 +111,329 @@ function PublicAgentTest() {
     }
   };
 
-  const handleUserMessage = useCallback(async (message) => {
-    if (!conversationId || isProcessingRef.current) return;
-    
-    // Don't process empty messages
-    if (!message || !message.trim()) return;
-
-    isProcessingRef.current = true;
-    setIsProcessing(true);
-    setInterimTranscript(''); // Clear interim transcript after finalizing
-    setMessages(prev => [...prev, { role: 'user', content: message.trim() }]);
-
-    // Stop recognition while processing
-    if (recognitionRef.current) {
-      try {
-        recognitionRef.current.stop();
-      } catch (e) {}
-    }
-
-    // Pause any playing audio
-    if (audioRef.current && !audioRef.current.paused) {
-      const currentTime = audioRef.current.currentTime;
-      const audioUrl = audioRef.current.src;
-      audioRef.current.pause();
-      setPausedAudioState({ currentTime, audioUrl });
-    }
-
-    try {
-      const response = await axios.post(`${API_BASE_URL}/conversation/chat`, {
-        message: message,
-        conversationId: conversationId,
-        publicToken: token // Include token for public access
-      });
-
-      const aiResponse = response.data.text;
-      setMessages(prev => [...prev, { role: 'assistant', content: aiResponse }]);
-
-      if (response.data.shouldEndCall) {
-        await stopConversation();
-        return;
-      }
-
-      if (response.data.audioUrl && isActiveRef.current) {
-        const audioUrl = toBackendAbsoluteUrl(response.data.audioUrl);
-        const audio = audioUrl ? new Audio(audioUrl) : null;
-        audioRef.current = audio;
-
-        // Handle interruption detection - check if user speaks while AI is talking
-        const checkForInterruption = (event) => {
-          if (!audio || audio.paused) return;
-          
-          let hasSpeech = false;
-          for (let i = event.resultIndex; i < event.results.length; i++) {
-            if (event.results[i][0].transcript.trim()) {
-              hasSpeech = true;
-              break;
-            }
-          }
-
-          if (hasSpeech) {
-            wasInterruptedRef.current = true;
-            audio.pause();
-            if (recognitionRef.current) {
-              recognitionRef.current.stop();
-            }
-            setTimeout(() => {
-              if (recognitionRef.current && isActiveRef.current) {
-                try {
-                  recognitionRef.current.start();
-                } catch (e) {}
-              }
-            }, 100);
-          }
-        };
-        
-        // Wrap the original handler to add interruption detection
-        const originalOnResult = originalRecognitionHandlerRef.current;
-        if (originalOnResult) {
-          const wrappedHandler = (event) => {
-            // Always call original handler first to process transcript
-            originalOnResult(event);
-            // Then check for interruption
-            checkForInterruption(event);
-          };
-          
-          recognitionRef.current.onresult = wrappedHandler;
-        }
-
-        audio && (audio.onended = () => {
-          audioRef.current = null;
-          // Restore original handler
-          if (recognitionRef.current && originalRecognitionHandlerRef.current) {
-            recognitionRef.current.onresult = originalRecognitionHandlerRef.current;
-          }
-          if (isActiveRef.current && !isProcessingRef.current) {
-            setIsListening(true);
-            setTimeout(() => {
-              if (recognitionRef.current && isActiveRef.current) {
-                try {
-                  recognitionRef.current.start();
-                } catch (e) {}
-              }
-            }, 100);
-          }
-        });
-
-        audio && (audio.onerror = () => {
-          audioRef.current = null;
-          // Restore original handler
-          if (recognitionRef.current && originalRecognitionHandlerRef.current) {
-            recognitionRef.current.onresult = originalRecognitionHandlerRef.current;
-          }
-          if (isActiveRef.current && !isProcessingRef.current) {
-            setIsListening(true);
-            setTimeout(() => {
-              if (recognitionRef.current && isActiveRef.current) {
-                try {
-                  recognitionRef.current.start();
-                } catch (e) {}
-              }
-            }, 100);
-          }
-        });
-
-        // Handle interruption
-        audio && (audio.onplay = () => {
-          wasInterruptedRef.current = false;
-        });
-
-        audio && (audio.onpause = () => {
-          if (wasInterruptedRef.current && pausedAudioState) {
-            audio.currentTime = pausedAudioState.currentTime;
-          }
-        });
-
-        audio?.play().catch(() => {
-          audioRef.current = null;
-          if (isActiveRef.current && !isProcessingRef.current) {
-            setIsListening(true);
-            setTimeout(() => {
-              if (recognitionRef.current && isActiveRef.current) {
-                try {
-                  recognitionRef.current.start();
-                } catch (e) {}
-              }
-            }, 100);
-          }
-        });
-      } else {
-        setIsListening(true);
-        setTimeout(() => {
-          if (recognitionRef.current && isActiveRef.current) {
-            try {
-              recognitionRef.current.start();
-            } catch (e) {}
-          }
-        }, 100);
-      }
-    } catch (error) {
-      console.error('Error sending message:', error);
-      setIsListening(true);
-      setTimeout(() => {
-        if (recognitionRef.current && isActiveRef.current) {
-          try {
-            recognitionRef.current.start();
-          } catch (e) {}
-        }
-      }, 100);
-    } finally {
-      isProcessingRef.current = false;
-      setIsProcessing(false);
-    }
-  }, [conversationId, token]);
-
-  // Initialize speech recognition
-  useEffect(() => {
-    if (!('webkitSpeechRecognition' in window) && !('SpeechRecognition' in window)) {
-      console.warn('Speech recognition not supported');
-      return;
-    }
-
-    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-    const recognition = new SpeechRecognition();
-    recognition.continuous = true;
-    recognition.interimResults = true;
-    recognition.lang = agent?.speechSettings?.language || 'en-US';
-
-    recognition.onstart = () => {
-      setIsListening(true);
-    };
-
-    recognition.onend = () => {
-      setIsListening(false);
-      if (isActiveRef.current && !isProcessingRef.current) {
-        setTimeout(() => {
-          if (recognitionRef.current && isActiveRef.current) {
-            try {
-              recognitionRef.current.start();
-            } catch (e) {
-              console.log('Recognition already running');
-            }
-          }
-        }, 100);
-      }
-    };
-
-    // Main recognition result handler - processes transcripts
-    const handleRecognitionResult = (event) => {
-      let interim = '';
-      let final = '';
-
-      for (let i = event.resultIndex; i < event.results.length; i++) {
-        const transcript = event.results[i][0].transcript;
-        if (event.results[i].isFinal) {
-          final += transcript + ' ';
-        } else {
-          interim += transcript;
-        }
-      }
-
-      setInterimTranscript(interim);
-
-      if (final.trim()) {
-        if (messageDebounceTimeoutRef.current) {
-          clearTimeout(messageDebounceTimeoutRef.current);
-        }
-
-        messageDebounceTimeoutRef.current = setTimeout(() => {
-          if (final.trim() && !isProcessingRef.current) {
-            handleUserMessage(final.trim());
-          }
-        }, 500);
-      }
-    };
-    
-    recognition.onresult = handleRecognitionResult;
-    // Store the recognition object and the original handler
-    recognitionRef.current = recognition;
-    originalRecognitionHandlerRef.current = handleRecognitionResult;
-
-    recognition.onerror = (event) => {
-      console.error('Speech recognition error:', event.error);
-      if (event.error === 'no-speech') {
-        // Restart recognition if no speech detected
-        if (isActiveRef.current && !isProcessingRef.current) {
-          setTimeout(() => {
-            if (recognitionRef.current && isActiveRef.current) {
-              try {
-                recognitionRef.current.start();
-              } catch (e) {}
-            }
-          }, 1000);
-        }
-      }
-    };
-
-    return () => {
-      if (recognitionRef.current) {
-        recognitionRef.current.stop();
-      }
-    };
-  }, [agent, handleUserMessage]);
+  // SpeechRecognition removed - using WebRTC only
 
   const startConversation = async () => {
-    if (!agent || !agent.systemPrompt?.trim()) {
-      alert('Agent is not properly configured');
-      return;
-    }
-
-    try {
-      isProcessingRef.current = true;
-      setIsProcessing(true);
-      
-      const response = await axios.post(`${API_BASE_URL}/conversation/start`, {
-        systemPrompt: agent.systemPrompt.trim(),
-        agentId: agent.id,
-        knowledgeBaseId: agent.knowledgeBaseId || null,
-        aiSpeaksFirst: agent.callSettings?.aiSpeaksFirst || false,
-        publicToken: token // Include token for public access
-      });
-
-      setConversationId(response.data.conversationId);
-      setIsActive(true);
-      isActiveRef.current = true;
-      setMessages([]);
-      setInterimTranscript('');
-
-      isProcessingRef.current = false;
-      setIsProcessing(false);
-
-      // If AI should speak first
-      if (agent.callSettings?.aiSpeaksFirst && response.data.initialGreeting) {
-        setMessages(prev => [...prev, { role: 'assistant', content: response.data.initialGreeting }]);
-
-        if (response.data.initialAudioUrl && isActiveRef.current) {
-          const audioUrl = toBackendAbsoluteUrl(response.data.initialAudioUrl);
-          const audio = audioUrl ? new Audio(audioUrl) : null;
-          audioRef.current = audio;
-
-          audio && (audio.onended = () => {
-            audioRef.current = null;
-            if (isActiveRef.current && !isProcessingRef.current) {
-              setIsListening(true);
-              setTimeout(() => {
-                if (recognitionRef.current && isActiveRef.current) {
-                  try {
-                    recognitionRef.current.start();
-                  } catch (e) {}
-                }
-              }, 100);
-            }
-          });
-
-          audio?.play().catch(() => {
-            audioRef.current = null;
-            if (isActiveRef.current && !isProcessingRef.current) {
-              setIsListening(true);
-            }
-          });
-        } else {
-          setIsListening(true);
-        }
-      } else {
-        setIsListening(true);
-        setTimeout(() => {
-          if (recognitionRef.current && isActiveRef.current) {
-            try {
-              recognitionRef.current.start();
-            } catch (e) {}
-          }
-        }, 300);
-      }
-    } catch (error) {
-      console.error('Error starting conversation:', error);
-      alert('Failed to start conversation');
-      isProcessingRef.current = false;
-      setIsProcessing(false);
-    }
+    return startRealtimeCall();
   };
 
   const stopConversation = async () => {
-    isActiveRef.current = false;
-    isProcessingRef.current = false;
-    setIsActive(false);
-    setIsListening(false);
-    setIsProcessing(false);
-    setInterimTranscript('');
-    if (recognitionRef.current) {
+    try {
       try {
-        recognitionRef.current.stop();
+        lkMicTrackRef.current?.stop?.();
       } catch (e) {}
-    }
-    if (audioRef.current) {
-      audioRef.current.pause();
-      audioRef.current = null;
-    }
-    if (cuttingAudioRef.current) {
-      cuttingAudioRef.current.pause();
-      cuttingAudioRef.current = null;
-    }
-    setPausedAudioState(null);
-    wasInterruptedRef.current = false;
-
-    if (conversationId) {
+      lkMicTrackRef.current = null;
       try {
-        await axios.post(`${API_BASE_URL}/conversation/${conversationId}/end`, {
-          endReason: 'user_hangup',
-          publicToken: token // Include token for public access
-        });
-      } catch (error) {
-        console.error('Error ending call:', error);
+        lkRoomRef.current?.disconnect?.();
+      } catch (e) {}
+      lkRoomRef.current = null;
+      if (lkAudioContainerRef.current) lkAudioContainerRef.current.innerHTML = '';
+
+      if (realtimeState?.callId || realtimeState?.roomName) {
+        try {
+          await axios.post(`${API_BASE_URL}/realtime/end`, {
+            callId: realtimeState.callId,
+            roomName: realtimeState.roomName,
+            endReason: 'user_hangup',
+            publicToken: token,
+            agentId: agent?.id
+          });
+        } catch (e) {}
       }
+    } finally {
+      isActiveRef.current = false;
+      isProcessingRef.current = false;
+      setIsActive(false);
+      setIsListening(false);
+      setIsProcessing(false);
+      setInterimTranscript('');
+      setMessages([]);
+      setConversationId(null);
+      setRealtimeState((s) => ({ ...s, status: 'ended', userSpeaking: false, agentSpeaking: false }));
     }
   };
+
+  const startRealtimeCall = useCallback(async () => {
+    if (!agent?.id) {
+      alert('Agent not loaded');
+      return;
+    }
+    try {
+      // stop any existing state
+      await stopConversation();
+      
+      setIsConnecting(true);
+      setIsProcessing(true);
+
+      setRealtimeState({
+        status: 'connecting',
+        roomName: null,
+        identity: null,
+        callId: null,
+        error: null,
+        userSpeaking: false,
+        agentSpeaking: false
+      });
+      lkConfigAckRef.current = false;
+
+      // Get token first (needed for roomName)
+      const tokenResp = await axios.post(`${API_BASE_URL}/realtime/token`, {
+        agentId: agent.id,
+        publicToken: token,
+        provider: 'web'
+      });
+      const { livekitUrl, accessToken, roomName, identity } = tokenResp.data || {};
+      if (!livekitUrl || !accessToken || !roomName) throw new Error('Realtime token response missing fields');
+
+      // Parallelize start request and config fetch
+      const [startResp, cfgResp] = await Promise.all([
+        axios.post(`${API_BASE_URL}/realtime/start`, {
+          agentId: agent.id,
+          publicToken: token,
+          provider: 'web',
+          roomName
+        }),
+        axios.post(`${API_BASE_URL}/realtime/config`, {
+          agentId: agent.id,
+          systemPrompt: agent.systemPrompt?.trim?.() || '',
+          knowledgeBaseId: agent.knowledgeBaseId || null,
+          publicToken: token
+        })
+      ]);
+      const callId = startResp.data?.callId || null;
+
+      const room = new Room({ adaptiveStream: true, dynacast: true });
+      lkRoomRef.current = room;
+      
+      // Set up latency polling
+      const statsInterval = setInterval(async () => {
+        try {
+          if (room && room.engine) {
+            const stats = await room.engine.client.getStats();
+            if (stats && stats.subscribedCodecs) {
+              // Get RTT from remote track stats
+              let rtt = null;
+              for (const codec of stats.subscribedCodecs || []) {
+                if (codec.remoteTrackStats && codec.remoteTrackStats.length > 0) {
+                  const trackStats = codec.remoteTrackStats[0];
+                  if (trackStats.rtt) {
+                    rtt = trackStats.rtt;
+                    break;
+                  }
+                }
+              }
+              setLivekitStats(prev => ({ ...prev, rtt }));
+            }
+          }
+        } catch (e) {
+          // Ignore errors
+        }
+      }, 500);
+      
+      // Clean up interval on disconnect
+      room.on(RoomEvent.Disconnected, () => {
+        clearInterval(statsInterval);
+        setRealtimeState((s) => ({ ...s, status: 'ended', userSpeaking: false, agentSpeaking: false }));
+      });
+
+      room.on(RoomEvent.TrackSubscribed, (track) => {
+        if (track?.kind !== 'audio') return;
+        const el = track.attach();
+        el.autoplay = true;
+        el.controls = false;
+        el.setAttribute('data-livekit-audio', 'true');
+        el.onplaying = async () => {
+          try {
+            const now = Date.now();
+            const turnId = lkLastTurnRef.current?.turnId || `play_${now}`;
+            if (lkSentPlayoutRef.current.has(turnId)) return;
+            lkSentPlayoutRef.current.add(turnId);
+            const vadEndAt = lkLastTurnRef.current?.vadEndAt ?? null;
+            const vadEndToPlayoutStartMs = typeof vadEndAt === 'number' ? now - vadEndAt : null;
+            await axios.post(`${API_BASE_URL}/realtime/metrics`, {
+              callId,
+              roomName,
+              agentId: agent.id,
+              publicToken: token,
+              turn: {
+                turnId,
+                vadEndAt,
+                clientPlayoutStartAt: now,
+                vadEndToPlayoutStartMs
+              }
+            });
+          } catch (e) {}
+        };
+        lkAudioContainerRef.current?.appendChild(el);
+      });
+
+      room.on(RoomEvent.TrackUnsubscribed, (track) => {
+        if (track?.kind !== 'audio') return;
+        try {
+          track.detach().forEach((el) => el.remove());
+        } catch (e) {}
+      });
+
+      room.on(RoomEvent.ActiveSpeakersChanged, (speakers) => {
+        const ids = new Set((speakers || []).map((p) => p?.identity).filter(Boolean));
+        const localId = room.localParticipant?.identity;
+        const userSpeaking = !!(localId && ids.has(localId));
+        const agentSpeaking = Array.from(ids).some((i) => i && i !== localId);
+        setRealtimeState((s) => ({ ...s, userSpeaking, agentSpeaking }));
+      });
+
+      // Built-in LiveKit transcription (delta segments) – lets us render assistant text while it speaks.
+      room.on(RoomEvent.TranscriptionReceived, (segments, participant) => {
+        try {
+          const pid = participant?.identity ? String(participant.identity) : '';
+          const isAssistant = pid && !pid.startsWith('web_');
+          if (!isAssistant) return;
+
+          const text = (segments || [])
+            .map((s) => (s?.text ? String(s.text) : ''))
+            .join('')
+            .trim();
+          if (!text) return;
+
+          const isFinal = (segments || []).every((s) => !!s?.final);
+          if (isFinal) {
+            setMessages((prev) => [...prev, { role: 'assistant', content: text }]);
+          }
+        } catch (e) {}
+      });
+
+      room.on(RoomEvent.DataReceived, async (payload) => {
+        try {
+          const txt = new TextDecoder().decode(payload);
+          const evt = JSON.parse(txt);
+          if (!evt || typeof evt !== 'object') return;
+
+          if (evt.type === 'agent_config_ack') {
+            // Config ack received
+            lkConfigAckRef.current = true;
+            return;
+          }
+
+          // Transcript events (sent via data channel)
+          if (evt.type === 'transcript' && typeof evt.text === 'string' && evt.text.trim()) {
+            const role = evt.role === 'user' ? 'user' : 'assistant';
+            const text = evt.text.trim();
+            
+            // Filter out system messages
+            const systemMessagePatterns = [
+              /^\(voice agent connected\)$/i,
+              /^\(agent config received\)$/i,
+              /^\(agent.*connected\)$/i,
+              /^\(.*config.*received\)$/i
+            ];
+            const isSystemMessage = systemMessagePatterns.some(pattern => pattern.test(text));
+            if (isSystemMessage) {
+              return;
+            }
+            
+            if (evt.final === false) {
+              // Partial transcript - word-by-word streaming
+              if (role === 'user') {
+                setInterimTranscript(text);
+              }
+            } else {
+              // Final transcript
+              if (role === 'user') {
+                setInterimTranscript('');
+                setMessages((prev) => [...prev, { role, content: text }]);
+              } else {
+                setMessages((prev) => [...prev, { role, content: text }]);
+              }
+            }
+          }
+
+          if (evt.turnId) lkLastTurnRef.current.turnId = String(evt.turnId);
+          if (typeof evt.vadEndAt === 'number') lkLastTurnRef.current.vadEndAt = evt.vadEndAt;
+          
+          // Update E2E latency from metrics
+          if (typeof evt.vadEndAt === 'number' && typeof evt.ttsFirstFrameAt === 'number') {
+            const e2e = evt.ttsFirstFrameAt - evt.vadEndAt;
+            setLivekitStats(prev => ({ ...prev, e2e }));
+          }
+          
+          if (evt.turnId && (typeof evt.vadEndAt === 'number' || typeof evt.ttsFirstFrameAt === 'number' || typeof evt.llmFirstTokenAt === 'number')) {
+            await axios.post(`${API_BASE_URL}/realtime/metrics`, {
+              callId,
+              roomName,
+              agentId: agent.id,
+              publicToken: token,
+              turn: {
+                turnId: String(evt.turnId),
+                vadEndAt: typeof evt.vadEndAt === 'number' ? evt.vadEndAt : undefined,
+                llmFirstTokenAt: typeof evt.llmFirstTokenAt === 'number' ? evt.llmFirstTokenAt : undefined,
+                ttsFirstFrameAt: typeof evt.ttsFirstFrameAt === 'number' ? evt.ttsFirstFrameAt : undefined
+              }
+            });
+          }
+        } catch (e) {}
+      });
+
+      // Connect and publish mic in parallel
+      await Promise.all([
+        room.connect(livekitUrl, accessToken),
+        // Publish mic
+        (async () => {
+          const micTrack = await createLocalAudioTrack({
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true
+          });
+          lkMicTrackRef.current = micTrack;
+          await room.localParticipant.publishTrack(micTrack);
+        })()
+      ]);
+
+      setRealtimeState((s) => ({ ...s, status: 'connected', roomName, identity: identity || null, callId }));
+
+      // Send config payload (reduced wait time)
+      try {
+        const cfg = cfgResp?.data || {};
+        const cfgPayload = new TextEncoder().encode(
+          JSON.stringify({
+            type: 'agent_config',
+            agentId: String(agent.id),
+            finalSystemPrompt: cfg.finalSystemPrompt || '',
+            speechSettings: cfg.speechSettings || {},
+            callSettings: cfg.callSettings || {}
+          })
+        );
+
+        // Reduced wait time: max 3s with 200ms intervals
+        const startedAt = Date.now();
+        let configAck = false;
+        while (!configAck && Date.now() - startedAt < 3000) {
+          await room.localParticipant.publishData(cfgPayload, { reliable: true, topic: 'agent_config' });
+          await new Promise((r) => setTimeout(r, 200));
+          // Check if ack received (would need to track this via data channel)
+        }
+      } catch (e) {
+        // best-effort
+      }
+      
+      setIsConnecting(false);
+      setIsActive(true);
+      isActiveRef.current = true;
+      setIsListening(true);
+      setIsProcessing(false);
+    } catch (err) {
+      console.error('Public realtime start failed:', err);
+      setIsConnecting(false);
+      setIsProcessing(false);
+      setRealtimeState((s) => ({
+        ...s,
+        status: 'error',
+        error: err?.response?.data?.error || err?.message || 'Failed to start realtime call'
+      }));
+      isActiveRef.current = false;
+      setIsActive(false);
+      setIsListening(false);
+    }
+  }, [agent?.id, stopConversation, token]);
 
   if (loading) {
     return (
@@ -505,13 +467,32 @@ function PublicAgentTest() {
             <button
               className="public-start-btn"
               onClick={startConversation}
-              disabled={isProcessing}
+              disabled={isProcessing || isConnecting}
             >
-              {isProcessing ? 'Starting...' : 'Start Conversation'}
+              {isConnecting ? (
+                <>
+                  <span className="spinner" style={{ display: 'inline-block', marginRight: '8px', animation: 'spin 1s linear infinite' }}>⟳</span>
+                  Connecting...
+                </>
+              ) : isProcessing ? 'Starting...' : 'Test'}
             </button>
           </div>
         ) : (
           <>
+            {/* Hidden-ish container for LiveKit audio track attachments.
+                Avoid `display:none` because some browsers won't autoplay hidden media. */}
+            <div
+              ref={lkAudioContainerRef}
+              style={{
+                position: 'absolute',
+                width: '1px',
+                height: '1px',
+                overflow: 'hidden',
+                clip: 'rect(0 0 0 0)',
+                clipPath: 'inset(50%)',
+                whiteSpace: 'nowrap'
+              }}
+            />
             <div className="public-agent-messages">
               {messages.map((msg, idx) => (
                 <div key={idx} className={`public-message ${msg.role}`}>

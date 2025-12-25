@@ -2,6 +2,7 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { motion, AnimatePresence } from 'framer-motion';
 import axios from 'axios';
+import { Room, RoomEvent, createLocalAudioTrack } from 'livekit-client';
 import VoiceSelectionModal from '../components/VoiceSelectionModal';
 import './AgentDetail.css';
 
@@ -70,13 +71,25 @@ function toBackendAbsoluteUrl(pathOrUrl) {
 }
 
 const OPENAI_MODELS = [
+  // Latest models (2024-2025)
+  { id: 'gpt-4o', name: 'GPT-4o (Latest)' },
+  { id: 'gpt-4o-mini', name: 'GPT-4o Mini (Fastest)' },
+  { id: 'o1-preview', name: 'O1 Preview (Reasoning)' },
+  { id: 'o1-mini', name: 'O1 Mini (Reasoning)' },
+  
+  // GPT-4 variants
   { id: 'gpt-4', name: 'GPT-4' },
   { id: 'gpt-4-turbo', name: 'GPT-4 Turbo' },
-  { id: 'gpt-4o', name: 'GPT-4o' },
-  { id: 'gpt-4o-mini', name: 'GPT-4o Mini' },
-  { id: 'gpt-3.5-turbo', name: 'GPT-3.5 Turbo' },
+  { id: 'gpt-4-turbo-preview', name: 'GPT-4 Turbo Preview' },
+  { id: 'gpt-4-32k', name: 'GPT-4 32k' },
   { id: 'gpt-4-1106-preview', name: 'GPT-4 1106 Preview' },
-  { id: 'gpt-4-0125-preview', name: 'GPT-4 0125 Preview' }
+  { id: 'gpt-4-0125-preview', name: 'GPT-4 0125 Preview' },
+  
+  // GPT-3.5 variants
+  { id: 'gpt-3.5-turbo', name: 'GPT-3.5 Turbo' },
+  { id: 'gpt-3.5-turbo-16k', name: 'GPT-3.5 Turbo 16k' },
+  { id: 'gpt-3.5-turbo-1106', name: 'GPT-3.5 Turbo 1106' },
+  { id: 'gpt-3.5-turbo-0125', name: 'GPT-3.5 Turbo 0125' }
 ];
 
 const LANGUAGES = [
@@ -106,13 +119,14 @@ function AgentDetail() {
   const [isProcessing, setIsProcessing] = useState(false);
   const [interimTranscript, setInterimTranscript] = useState('');
   const [assistantDraft, setAssistantDraft] = useState('');
-  const [latencyInfo, setLatencyInfo] = useState(null);
   const [callStats, setCallStats] = useState(null);
   const [pausedAudioState, setPausedAudioState] = useState(null);
   const [knowledgeBases, setKnowledgeBases] = useState([]);
-  const [selectedKB, setSelectedKB] = useState('');
+  const [selectedKB, setSelectedKB] = useState(''); // Keep for backward compatibility
+  const [selectedKBs, setSelectedKBs] = useState([]); // Array for multiple KBs
+  const [showKBAddDropdown, setShowKBAddDropdown] = useState(false);
   const [expandedSettings, setExpandedSettings] = useState({
-    knowledgeBase: true,
+    knowledgeBase: false,
     speechSettings: false,
     callSettings: false,
     functions: false
@@ -131,16 +145,39 @@ function AgentDetail() {
   const [showVoiceModal, setShowVoiceModal] = useState(false);
   const [callSettings, setCallSettings] = useState({
     pauseBeforeSpeaking: 0,
-    aiSpeaksFirst: true
+    aiSpeaksFirst: true,
+    welcomeMessageType: 'dynamic', // 'dynamic' | 'custom'
+    customWelcomeMessage: ''
   });
-  // Legacy-only: browser SpeechRecognition + HTTP chat
+  const [realtimeState, setRealtimeState] = useState({
+    status: 'idle', // idle|connecting|connected|ended|error
+    roomName: null,
+    identity: null,
+    callId: null,
+    error: null,
+    userSpeaking: false,
+    agentSpeaking: false
+  });
+  const [isConnecting, setIsConnecting] = useState(false);
+  const [isStopping, setIsStopping] = useState(false);
+  const [livekitStats, setLivekitStats] = useState({ rtt: null, e2e: null });
   const [shareableLink, setShareableLink] = useState('');
   const [isPublic, setIsPublic] = useState(false);
+  const [promptHasChanges, setPromptHasChanges] = useState(false);
+  const [originalPrompt, setOriginalPrompt] = useState('');
+  const [toasts, setToasts] = useState([]);
   
   const audioRef = useRef(null);
   const cuttingAudioRef = useRef(null);
-  const recognitionRef = useRef(null);
-  const recognitionRunningRef = useRef(false);
+  const ambientAudioRef = useRef(null);
+  const lkRoomRef = useRef(null);
+  const lkMicTrackRef = useRef(null);
+  const lkAudioContainerRef = useRef(null);
+  const lkLastTurnRef = useRef({ turnId: null, vadEndAt: null });
+  const lkSentPlayoutRef = useRef(new Set());
+  const lkAssistantCaptionRef = useRef('');
+  const lkConfigAckRef = useRef(false);
+  const lkAgentReadyRef = useRef(false);
   const isProcessingRef = useRef(false);
   const pendingMessageRef = useRef(null);
   const messageDebounceTimeoutRef = useRef(null);
@@ -178,29 +215,13 @@ function AgentDetail() {
     return s;
   }, []);
 
+  const getAuthHeaders = useCallback(() => {
+    const token = localStorage.getItem('token');
+    return token ? { Authorization: `Bearer ${token}` } : {};
+  }, []);
+
   // (Streaming/Deepgram removed)
 
-  const safeStartRecognition = useCallback((delayMs = 0) => {
-    if (!isActiveRef.current) return;
-    if (!recognitionRef.current) return;
-    if (recognitionRunningRef.current) return;
-
-    const run = () => {
-      if (!isActiveRef.current) return;
-      if (!recognitionRef.current) return;
-      if (recognitionRunningRef.current) return;
-      try {
-        // Optimistically mark running to avoid double-start spam.
-        recognitionRunningRef.current = true;
-        recognitionRef.current.start();
-      } catch (e) {
-        recognitionRunningRef.current = false;
-      }
-    };
-
-    if (delayMs > 0) setTimeout(run, delayMs);
-    else run();
-  }, []);
 
   const stopPrefetch = useCallback(() => {
     if (prefetchDebounceTimeoutRef.current) {
@@ -215,7 +236,6 @@ function AgentDetail() {
     }
     // Prefetch should not show assistant text; keep it hidden.
     prefetchHiddenTextRef.current = '';
-    setLatencyInfo(null);
   }, []);
 
   const stopAssistantAudioQueue = useCallback(() => {
@@ -285,87 +305,9 @@ function AgentDetail() {
     // Keep listening
     if (isActiveRef.current) {
       setIsListening(true);
-      safeStartRecognition(0);
     }
-  }, [safeStartRecognition, stopAssistantAudioQueue]);
+  }, [stopAssistantAudioQueue]);
 
-  const playNextQueuedAudio = useCallback(() => {
-    if (!isActiveRef.current) return;
-    if (isPlayingQueueRef.current) return;
-    const next = audioQueueRef.current.shift();
-    if (!next) return;
-    isPlayingQueueRef.current = true;
-
-    // We enqueue Audio objects already preloaded to avoid gaps between chunks.
-    const audio =
-      next && typeof next.play === 'function'
-        ? next
-        : (() => {
-            const fullUrl = toBackendAbsoluteUrl(next);
-            if (!fullUrl) return null;
-            const a = new Audio(fullUrl);
-            a.preload = 'auto';
-            try {
-              a.load();
-            } catch (e) {}
-            return a;
-          })();
-    if (!audio) {
-      isPlayingQueueRef.current = false;
-      setTimeout(() => playNextQueuedAudio(), 0);
-      return;
-    }
-    // Mark this as chunked so interruption logic can treat it differently
-    audio._isChunkedTts = true;
-    audioRef.current = audio;
-
-    audio.onended = () => {
-      audioRef.current = null;
-      isPlayingQueueRef.current = false;
-      // Continue queue
-      setTimeout(() => playNextQueuedAudio(), 0);
-    };
-    audio.onerror = () => {
-      audioRef.current = null;
-      isPlayingQueueRef.current = false;
-      setTimeout(() => playNextQueuedAudio(), 0);
-    };
-
-    // Keep listening while the agent speaks
-    if (isActiveRef.current) {
-      setIsListening(true);
-      safeStartRecognition(50);
-    }
-
-    audio.play().catch(() => {
-      audioRef.current = null;
-      isPlayingQueueRef.current = false;
-      setTimeout(() => playNextQueuedAudio(), 0);
-    });
-  }, [safeStartRecognition]);
-
-  const enqueueAssistantAudio = useCallback((audioUrl) => {
-    if (!audioUrl) return;
-    // Pre-create + preload the audio element immediately so the next chunk has no startup gap.
-    const fullUrl = toBackendAbsoluteUrl(audioUrl);
-    const audio = fullUrl ? new Audio(fullUrl) : null;
-    if (audio) {
-      audio.preload = 'auto';
-      // Mark as chunked
-      audio._isChunkedTts = true;
-      try {
-        audio.load();
-      } catch (e) {}
-      audioQueueRef.current.push(audio);
-    } else {
-      // fallback
-      audioQueueRef.current.push(audioUrl);
-    }
-    // Start if idle
-    if (!isPlayingQueueRef.current) {
-      playNextQueuedAudio();
-    }
-  }, [playNextQueuedAudio]);
 
   const streamNdjson = useCallback(async ({ url, body, onEvent, signal }) => {
     const token = localStorage.getItem('token');
@@ -406,119 +348,683 @@ function AgentDetail() {
     }
   }, []);
 
+  // Start ambient office noise (low volume, looping)
+  const startAmbientNoise = useCallback(() => {
+    try {
+      // Stop any existing ambient noise
+      if (ambientAudioRef.current) {
+        if (ambientAudioRef.current.pause) {
+          ambientAudioRef.current.pause();
+        } else if (ambientAudioRef.current.stop) {
+          ambientAudioRef.current.stop();
+        }
+        ambientAudioRef.current = null;
+      }
+      
+      // Generate office-like ambient noise using Web Audio API
+      const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+      const bufferSize = 4096;
+      const sampleRate = audioContext.sampleRate;
+      const duration = 2; // 2 seconds of noise, will loop
+      const frameCount = sampleRate * duration;
+      
+      const noiseBuffer = audioContext.createBuffer(2, frameCount, sampleRate);
+      
+      // Generate filtered noise for both channels (stereo)
+      for (let channel = 0; channel < 2; channel++) {
+        const channelData = noiseBuffer.getChannelData(channel);
+        for (let i = 0; i < frameCount; i++) {
+          // Generate brown noise (more natural than white noise)
+          const brown = Math.random() * 2 - 1;
+          channelData[i] = brown * 0.1; // Low amplitude
+        }
+      }
+      
+      const noiseSource = audioContext.createBufferSource();
+      noiseSource.buffer = noiseBuffer;
+      noiseSource.loop = true;
+      
+      // Add low-pass filter to make it sound like office ambience
+      const filter = audioContext.createBiquadFilter();
+      filter.type = 'lowpass';
+      filter.frequency.value = 800; // Muffled office sound
+      filter.Q.value = 1;
+      
+      // Add slight reverb/delay for more natural sound
+      const delay = audioContext.createDelay(0.1);
+      delay.delayTime.value = 0.05;
+      
+      const gainNode = audioContext.createGain();
+      gainNode.gain.value = 0.15; // 15% volume - not too loud, normal level
+      
+      // Connect: noise -> filter -> delay -> gain -> output
+      noiseSource.connect(filter);
+      filter.connect(delay);
+      delay.connect(gainNode);
+      gainNode.connect(audioContext.destination);
+      
+      noiseSource.start(0);
+      
+      // Store reference for cleanup
+      ambientAudioRef.current = {
+        pause: () => {
+          try {
+            noiseSource.stop();
+            audioContext.close();
+          } catch (e) {
+            // ignore
+          }
+        },
+        stop: () => {
+          try {
+            noiseSource.stop();
+            audioContext.close();
+          } catch (e) {
+            // ignore
+          }
+        },
+        audioContext,
+        noiseSource
+      };
+      
+      console.log('🔊 Started ambient office noise');
+    } catch (err) {
+      console.warn('Failed to start ambient noise:', err);
+      // Silent fail - ambient noise is optional
+    }
+  }, []);
+
+  // Stop ambient office noise
+  const stopAmbientNoise = useCallback(() => {
+    try {
+      if (ambientAudioRef.current) {
+        if (ambientAudioRef.current.pause) {
+          ambientAudioRef.current.pause();
+        } else if (ambientAudioRef.current.stop) {
+          ambientAudioRef.current.stop();
+        }
+        if (ambientAudioRef.current.audioContext) {
+          try {
+            ambientAudioRef.current.audioContext.close();
+          } catch (e) {
+            // ignore
+          }
+        }
+        ambientAudioRef.current = null;
+        console.log('🔇 Stopped ambient office noise');
+      }
+    } catch (err) {
+      // ignore
+    }
+  }, []);
+
   const stopConversation = useCallback(async () => {
+    // Prevent multiple stop calls
+    if (isStopping) return;
+    
+    setIsStopping(true);
+    
+    // Stop ambient noise
+    stopAmbientNoise();
+    
+    // Update UI state IMMEDIATELY for instant feedback
     isActiveRef.current = false;
     isProcessingRef.current = false;
     setIsActive(false);
     setIsListening(false);
     setIsProcessing(false);
+    setIsConnecting(false);
     setInterimTranscript('');
-    stopPrefetch();
-    stopAssistantAudioQueue();
-    if (recognitionRef.current) {
-      try {
-        recognitionRef.current.stop();
-        recognitionRunningRef.current = false;
-      } catch (e) {}
-    }
-    if (audioRef.current) {
-      audioRef.current.pause();
-      audioRef.current = null;
-    }
-    if (cuttingAudioRef.current) {
-      cuttingAudioRef.current.pause();
-      cuttingAudioRef.current = null;
-    }
-    setPausedAudioState(null);
-    wasInterruptedRef.current = false;
-    if (resumeTimeoutRef.current) {
-      clearTimeout(resumeTimeoutRef.current);
-      resumeTimeoutRef.current = null;
-    }
-
-    // End the call and save to history
-    if (conversationId) {
-      try {
-        await axios.post(`${API_BASE_URL}/conversation/${conversationId}/end`, {
-          endReason: 'user_hangup'
-        });
-      } catch (error) {
-        console.error('Error ending call:', error);
-      }
-    }
-  }, [conversationId, stopPrefetch, stopAssistantAudioQueue]);
-
-  const startConversationLegacy = useCallback(async () => {
-    if (!systemPrompt.trim()) {
-      alert('Please enter a system prompt for the agent');
-      return;
-    }
-
+    setAssistantDraft('');
+    setRealtimeState((s) => ({ ...s, status: 'ending', userSpeaking: false, agentSpeaking: false }));
+    
+    // Stop local mic track (non-blocking)
     try {
-      // Stop any streaming session first
-      await stopConversation();
+      lkMicTrackRef.current?.stop?.();
+    } catch (e) {}
+    lkMicTrackRef.current = null;
 
-      isProcessingRef.current = true;
-      setIsProcessing(true);
+    // Disconnect room (non-blocking but more forceful)
+    try {
+      if (lkRoomRef.current) {
+        // Get room name before disconnecting for logging
+        const roomName = lkRoomRef.current.name;
+        console.log(`🔌 Disconnecting room: ${roomName}`);
+        
+        // Disconnect and wait a bit to ensure it completes
+        await Promise.race([
+          lkRoomRef.current.disconnect(),
+          new Promise((resolve) => setTimeout(resolve, 1000)) // Max 1s wait
+        ]);
+        
+        console.log(`✅ Room disconnected: ${roomName}`);
+      }
+    } catch (e) {
+      console.warn('Error disconnecting room:', e);
+    }
+    lkRoomRef.current = null;
 
-      const response = await axios.post(`${API_BASE_URL}/conversation/start`, {
-        systemPrompt: systemPrompt.trim(),
-        agentId: id,
-        knowledgeBaseId: selectedKB || null,
-        aiSpeaksFirst: callSettings.aiSpeaksFirst || false
+    // Remove attached audio elements
+    if (lkAudioContainerRef.current) {
+      lkAudioContainerRef.current.innerHTML = '';
+    }
+
+    // Clear messages and stats immediately
+    setCallStats(null);
+    setMessages([]);
+    setConversationId(null);
+    setRealtimeState((s) => ({ ...s, status: 'ended', userSpeaking: false, agentSpeaking: false }));
+    
+    // Best-effort: end backend call record and save transcripts/audio (fire and forget - don't wait)
+    if (realtimeState?.callId || realtimeState?.roomName) {
+      // Prepare messages for saving (filter out system messages)
+      const messagesToSave = messages
+        .filter(msg => msg.role === 'user' || msg.role === 'assistant')
+        .map(msg => ({
+          role: msg.role,
+          content: msg.content
+        }));
+
+      console.log(`💾 Saving ${messagesToSave.length} messages to call history`, {
+        callId: realtimeState.callId,
+        roomName: realtimeState.roomName,
+        messageCount: messagesToSave.length
       });
 
-      setConversationId(response.data.conversationId);
-      setIsActive(true);
-      isActiveRef.current = true;
-      setMessages([]);
+      axios.post(
+        `${API_BASE_URL}/realtime/end`,
+        {
+          callId: realtimeState.callId,
+          roomName: realtimeState.roomName,
+          endReason: 'user_hangup',
+          messages: messagesToSave.length > 0 ? messagesToSave : undefined,
+          // audioUrl will be set by backend if recording exists
+        },
+        { headers: getAuthHeaders() }
+      ).then(() => {
+        console.log('✅ Messages saved to call history');
+      }).catch((err) => {
+        console.error('❌ Failed to save messages to call history:', err);
+        // ignore errors - already stopped locally
+      });
+    }
+    
+    setIsStopping(false);
+  }, [isStopping, getAuthHeaders, realtimeState.callId, realtimeState.roomName, stopPrefetch, stopAssistantAudioQueue]);
+
+  const startConversationRealtime = useCallback(async () => {
+    try {
+      // CRITICAL: Force disconnect any existing room FIRST (before stopConversation)
+      // This prevents duplicate connections to the same room
+      if (lkRoomRef.current) {
+        console.log('🔌 Force disconnecting existing room before starting new call...');
+        try {
+          const oldRoom = lkRoomRef.current;
+          await Promise.race([
+            oldRoom.disconnect(),
+            new Promise((resolve) => setTimeout(resolve, 1000)) // Max 1s wait
+          ]);
+          console.log('✅ Old room disconnected');
+        } catch (e) {
+          console.warn('Error disconnecting existing room:', e);
+        }
+        lkRoomRef.current = null;
+      }
+      
+      // Stop any existing session
+      await stopConversation();
+      
+      // Wait a bit to ensure old connection is fully closed before creating new one
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      
+      // Additional cleanup - ensure everything is reset
+      lkConfigAckRef.current = false;
+      lkAgentReadyRef.current = false;
+      
+      setIsConnecting(true);
+
+      setRealtimeState({
+        status: 'connecting',
+        roomName: null,
+        identity: null,
+        callId: null,
+        error: null,
+        userSpeaking: false,
+        agentSpeaking: false
+      });
+      lkAssistantCaptionRef.current = '';
+      lkConfigAckRef.current = false;
+      lkAgentReadyRef.current = false;
+      setAssistantDraft('');
       setInterimTranscript('');
 
-      isProcessingRef.current = false;
-      setIsProcessing(false);
+      // Get token first (needed for roomName)
+      const tokenResp = await axios.post(
+        `${API_BASE_URL}/realtime/token`,
+        { agentId: id, provider: 'web' },
+        { headers: getAuthHeaders() }
+      );
 
-      const startListening = () => {
-        setIsListening(true);
-        setTimeout(() => {
-          if (recognitionRef.current && isActiveRef.current) {
-            try {
-              recognitionRef.current.start();
-            } catch (e) {}
-          }
-        }, 150);
-      };
-
-      // AI greeting (optional)
-      if (callSettings.aiSpeaksFirst && response.data.initialGreeting) {
-        setMessages(prev => [...prev, { role: 'assistant', content: response.data.initialGreeting }]);
+      const { livekitUrl, accessToken, roomName, identity } = tokenResp.data || {};
+      if (!livekitUrl || !accessToken || !roomName) {
+        throw new Error('Realtime token response missing fields');
       }
 
-      if (callSettings.aiSpeaksFirst && response.data.initialAudioUrl && isActiveRef.current) {
-        const audioUrl = toBackendAbsoluteUrl(response.data.initialAudioUrl);
-        const audio = audioUrl ? new Audio(audioUrl) : null;
-        audioRef.current = audio;
-        audio.onended = () => {
-          audioRef.current = null;
-          startListening();
+      // Parallelize start request, config fetch, and LiveKit connection
+      const [startResp, cfgResp] = await Promise.all([
+        axios.post(
+          `${API_BASE_URL}/realtime/start`,
+          { agentId: id, roomName, provider: 'web' },
+          { headers: getAuthHeaders() }
+        ),
+        axios.post(
+          `${API_BASE_URL}/realtime/config`,
+          {
+            agentId: id,
+            systemPrompt: systemPrompt?.trim?.() || '',
+            knowledgeBaseIds: selectedKBs.length > 0 ? selectedKBs : (selectedKB ? [selectedKB] : []), // Pass all selected KBs
+            knowledgeBaseId: selectedKBs.length > 0 ? selectedKBs[0] : (selectedKB || null) // Backward compatibility
+          },
+          { headers: getAuthHeaders() }
+        )
+      ]);
+
+      const callId = startResp.data?.callId || null;
+
+      // Connect to LiveKit immediately (don't wait for config)
+      const room = new Room({
+        adaptiveStream: true,
+        dynacast: true
+      });
+      lkRoomRef.current = room;
+      
+      // Set up latency polling - store interval ref for cleanup
+      const statsIntervalRef = { current: null };
+      statsIntervalRef.current = setInterval(async () => {
+        try {
+          if (room && room.engine && room.engine.client) {
+            let rtt = null;
+            
+            // Try to get RTT from getStats()
+            try {
+              const stats = await room.engine.client.getStats();
+              if (stats) {
+                // Try to find RTT in various places in the stats object
+                if (stats.subscribedCodecs) {
+                  for (const codec of stats.subscribedCodecs || []) {
+                    if (codec.remoteTrackStats && codec.remoteTrackStats.length > 0) {
+                      const trackStats = codec.remoteTrackStats[0];
+                      if (trackStats.rtt) {
+                        rtt = trackStats.rtt;
+                        break;
+                      }
+                    }
+                  }
+                }
+                
+                // Also check publishedCodecs for local tracks
+                if (!rtt && stats.publishedCodecs) {
+                  for (const codec of stats.publishedCodecs || []) {
+                    if (codec.localTrackStats && codec.localTrackStats.length > 0) {
+                      const trackStats = codec.localTrackStats[0];
+                      if (trackStats.rtt) {
+                        rtt = trackStats.rtt;
+                        break;
+                      }
+                    }
+                  }
+                }
+              }
+            } catch (e) {
+              // getStats() might not be available or might throw
+            }
+            
+            if (rtt !== null) {
+              setLivekitStats(prev => ({ ...prev, rtt }));
+            }
+          }
+        } catch (e) {
+          // Ignore errors
+        }
+      }, 500);
+      
+      // Also listen for connection quality changes for RTT (alternative method)
+      room.on(RoomEvent.ConnectionQualityChanged, (quality, participant) => {
+        try {
+          // ConnectionQualityChanged provides quality info
+          // The quality parameter might have latency info
+          if (participant && participant.identity === room.localParticipant?.identity) {
+            // Try to extract RTT from quality if available
+            // Note: ConnectionQuality might not directly expose RTT, but we try
+            if (quality && typeof quality === 'object') {
+              // Some LiveKit versions expose connection quality differently
+              // This is a best-effort attempt
+            }
+          }
+        } catch (e) {}
+      });
+      
+      // Clean up interval on disconnect
+      room.on(RoomEvent.Disconnected, () => {
+        if (statsIntervalRef.current) {
+          clearInterval(statsIntervalRef.current);
+          statsIntervalRef.current = null;
+        }
+      });
+
+      room.on(RoomEvent.Disconnected, () => {
+        setRealtimeState((s) => ({ ...s, status: 'ended', userSpeaking: false, agentSpeaking: false }));
+      });
+
+      room.on(RoomEvent.TrackSubscribed, (track) => {
+        // Attach remote audio (agent track)
+        if (track?.kind !== 'audio') return;
+        const el = track.attach();
+        el.autoplay = true;
+        el.controls = false;
+        el.setAttribute('data-livekit-audio', 'true');
+        el.onplaying = async () => {
+          try {
+            const now = Date.now();
+            const turnId = lkLastTurnRef.current?.turnId || `play_${now}`;
+            if (lkSentPlayoutRef.current.has(turnId)) return;
+            lkSentPlayoutRef.current.add(turnId);
+            const vadEndAt = lkLastTurnRef.current?.vadEndAt ?? null;
+            const vadEndToPlayoutStartMs = typeof vadEndAt === 'number' ? now - vadEndAt : null;
+            await axios.post(
+              `${API_BASE_URL}/realtime/metrics`,
+              {
+                callId,
+                roomName,
+                turn: {
+                  turnId,
+                  vadEndAt,
+                  clientPlayoutStartAt: now,
+                  vadEndToPlayoutStartMs
+                }
+              },
+              { headers: getAuthHeaders() }
+            );
+          } catch (e) {
+            // ignore
+          }
         };
-        audio.onerror = () => {
-          audioRef.current = null;
-          startListening();
-        };
-        audio?.play().catch(() => {
-          audioRef.current = null;
-          startListening();
-        });
+        lkAudioContainerRef.current?.appendChild(el);
+      });
+
+      room.on(RoomEvent.TrackUnsubscribed, (track) => {
+        if (track?.kind !== 'audio') return;
+        try {
+          track.detach().forEach((el) => el.remove());
+        } catch (e) {}
+      });
+
+      room.on(RoomEvent.ActiveSpeakersChanged, (speakers) => {
+        const ids = new Set((speakers || []).map((p) => p?.identity).filter(Boolean));
+        const localId = room.localParticipant?.identity;
+        const userSpeaking = !!(localId && ids.has(localId));
+        // Any non-local speaker is treated as "agent speaking" for UI
+        const agentSpeaking = Array.from(ids).some((i) => i && i !== localId);
+        setRealtimeState((s) => ({ ...s, userSpeaking, agentSpeaking }));
+      });
+
+      // Disable RoomEvent.TranscriptionReceived for assistant - DataChannelTranscriptTee handles all assistant transcripts
+      // This prevents duplicate/conflicting transcripts and ensures word-by-word streaming works correctly
+
+      room.on(RoomEvent.DataReceived, async (payload) => {
+        try {
+          // Agent-worker can send JSON events with timing fields.
+          const txt = new TextDecoder().decode(payload);
+          const evt = JSON.parse(txt);
+          if (!evt || typeof evt !== 'object') return;
+
+          if (evt.type === 'agent_config_ack') {
+            lkConfigAckRef.current = true;
+            console.log('✅ Agent config acknowledged');
+            return;
+          }
+          
+          if (evt.type === 'agent_ready') {
+            console.log('✅ Agent fully initialized and ready to interact');
+            lkAgentReadyRef.current = true;
+            // Agent is now fully loaded with prompt and ready
+            // If we're still connecting, open the dialogue now
+            if (isConnecting && !isActive) {
+              setIsConnecting(false);
+              setIsActive(true);
+              isActiveRef.current = true;
+              setIsListening(true);
+              setIsProcessing(false);
+              console.log('🎯 Opening dialogue - agent is ready!');
+            }
+          }
+
+          // Transcript events (sent via data channel)
+          // { type: 'transcript', role: 'user'|'assistant', text: string, final?: boolean }
+          if (evt.type === 'transcript' && typeof evt.text === 'string' && evt.text.trim()) {
+            const role = evt.role === 'user' ? 'user' : 'assistant';
+            const text = evt.text.trim();
+            
+            // Filter out system messages (like Retell AI - no internal status messages)
+            const systemMessagePatterns = [
+              /^\(voice agent connected\)$/i,
+              /^\(agent config received\)$/i,
+              /^\(agent.*connected\)$/i,
+              /^\(.*config.*received\)$/i
+            ];
+            
+            const isSystemMessage = systemMessagePatterns.some(pattern => pattern.test(text));
+            if (isSystemMessage) {
+              return; // Skip system messages
+            }
+            
+            if (evt.final === false) {
+              // Partial transcript - sentence-by-sentence for assistant
+              if (role === 'user') {
+                setInterimTranscript(text);
+              } else {
+                // For assistant: show sentences as they come (sentence-by-sentence)
+                // Each partial update contains accumulated sentences so far
+                setAssistantDraft(text);
+              }
+            } else {
+              // Final transcript - move to permanent messages
+              if (role === 'user') {
+                setInterimTranscript('');
+                // Add user message with unique ID - always append to maintain chronological order
+                setMessages((prev) => [...prev, { 
+                  role, 
+                  content: text,
+                  id: `user_${Date.now()}_${Math.random()}`
+                }]);
+              } else {
+                // For assistant: Final message - move draft to permanent messages
+                const finalText = text.trim();
+                if (finalText) {
+                  const messageId = `assistant_${Date.now()}_${Math.random()}`;
+                  // Clear draft and add final message
+                  setAssistantDraft('');
+                  setMessages((prev) => {
+                    // Simply append - no deletion, no filtering
+                    return [...prev, { 
+                      role, 
+                      content: finalText,
+                      id: messageId
+                    }];
+                  });
+                }
+              }
+            }
+          }
+
+          // Handle metrics events (latency tracking)
+          if (evt.type === 'metrics') {
+            // Update stored metrics
+            if (evt.turnId) lkLastTurnRef.current.turnId = String(evt.turnId);
+            if (typeof evt.vadEndAt === 'number') {
+              lkLastTurnRef.current.vadEndAt = evt.vadEndAt;
+            }
+            
+            // Update E2E latency when we have both vadEndAt and ttsFirstFrameAt
+            // Ensure values are in milliseconds (not seconds) for correct calculation
+            const storedVadEnd = lkLastTurnRef.current.vadEndAt;
+            if (typeof storedVadEnd === 'number' && typeof evt.ttsFirstFrameAt === 'number') {
+              // Both should be in milliseconds - calculate E2E latency
+              let e2e = evt.ttsFirstFrameAt - storedVadEnd;
+              // Sanity check: if e2e is unreasonably large (>10 seconds), likely a calculation error
+              if (e2e > 10000) {
+                // If ttsFirstFrameAt seems to be in seconds, convert to ms
+                if (evt.ttsFirstFrameAt < 1000000000) {
+                  e2e = (evt.ttsFirstFrameAt * 1000) - storedVadEnd;
+                } else {
+                  // If storedVadEnd seems wrong, recalculate
+                  e2e = evt.ttsFirstFrameAt - (storedVadEnd * 1000);
+                }
+              }
+              // Only set if reasonable (between 0 and 10 seconds)
+              if (e2e >= 0 && e2e <= 10000) {
+                setLivekitStats(prev => ({ ...prev, e2e }));
+              }
+            }
+            
+            // Persist metrics to backend
+            if (
+              evt.turnId &&
+              (typeof evt.vadEndAt === 'number' ||
+                typeof evt.ttsFirstFrameAt === 'number' ||
+                typeof evt.llmFirstTokenAt === 'number')
+            ) {
+              await axios.post(
+                `${API_BASE_URL}/realtime/metrics`,
+                {
+                  callId,
+                  roomName,
+                  turn: {
+                    turnId: String(evt.turnId),
+                    vadEndAt: typeof evt.vadEndAt === 'number' ? evt.vadEndAt : undefined,
+                    llmFirstTokenAt: typeof evt.llmFirstTokenAt === 'number' ? evt.llmFirstTokenAt : undefined,
+                    ttsFirstFrameAt: typeof evt.ttsFirstFrameAt === 'number' ? evt.ttsFirstFrameAt : undefined
+                  }
+                },
+                { headers: getAuthHeaders() }
+              );
+            }
+          }
+        } catch (e) {
+          // ignore
+        }
+      });
+
+      // Connect and publish mic in parallel
+      await Promise.all([
+        room.connect(livekitUrl, accessToken),
+        // Publish mic
+        (async () => {
+          const micTrack = await createLocalAudioTrack({
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true
+          });
+          lkMicTrackRef.current = micTrack;
+          await room.localParticipant.publishTrack(micTrack);
+        })()
+      ]);
+
+      setRealtimeState((s) => ({
+        ...s,
+        status: 'connected',
+        roomName,
+        identity: identity || null,
+        callId
+      }));
+
+      // Send config payload (reduced wait time)
+      try {
+        const cfg = cfgResp?.data || {};
+        const cfgPayload = new TextEncoder().encode(
+          JSON.stringify({
+            type: 'agent_config',
+            agentId: String(id),
+            finalSystemPrompt: cfg.finalSystemPrompt || '',
+            speechSettings: cfg.speechSettings || {},
+            callSettings: {
+              ...(cfg.callSettings || {}),
+              aiSpeaksFirst: !!callSettings?.aiSpeaksFirst,
+              welcomeMessageType: callSettings?.welcomeMessageType || 'dynamic',
+              customWelcomeMessage: callSettings?.customWelcomeMessage || ''
+            }
+          })
+        );
+
+        // Wait for config ack: max 5s with 150ms intervals (optimized for faster startup)
+        const startedAt = Date.now();
+        let attempts = 0;
+        while (!lkConfigAckRef.current && Date.now() - startedAt < 5000) {
+          await room.localParticipant.publishData(cfgPayload, { reliable: true, topic: 'agent_config' });
+          attempts++;
+          if (attempts === 1) {
+            console.log('📤 Sending agent config to Python worker...', {
+              promptLength: cfg.finalSystemPrompt?.length || 0,
+              hasSpeechSettings: !!cfg.speechSettings,
+              hasCallSettings: !!cfg.callSettings
+            });
+          }
+          await new Promise((r) => setTimeout(r, 150));
+        }
+        if (lkConfigAckRef.current) {
+          console.log('✅ Agent config acknowledged by Python worker');
+        } else {
+          console.warn('⚠️ Agent config ack not received within timeout');
+        }
+      } catch (e) {
+        // best-effort
+      }
+      
+      // Wait for agent_ready signal before opening dialogue (max 8s total wait)
+      // This ensures the agent is fully initialized and ready to speak
+      const agentReadyStartedAt = Date.now();
+      const maxWaitTime = 8000; // 8 seconds max wait
+      
+      while (!lkAgentReadyRef.current && Date.now() - agentReadyStartedAt < maxWaitTime) {
+        await new Promise((r) => setTimeout(r, 100)); // Check every 100ms
+      }
+      
+      if (lkAgentReadyRef.current) {
+        console.log('✅ Agent ready - opening dialogue now');
+        setIsConnecting(false);
+        setIsActive(true);
+        isActiveRef.current = true;
+        setIsListening(true);
+        setIsProcessing(false);
+        
+        // Start ambient office noise
+        startAmbientNoise();
       } else {
-        startListening();
+        // Timeout: open anyway but log warning
+        console.warn('⚠️ Agent ready signal not received within timeout, opening dialogue anyway');
+        setIsConnecting(false);
+        setIsActive(true);
+        isActiveRef.current = true;
+        setIsListening(true);
+        setIsProcessing(false);
+        
+        // Start ambient office noise
+        startAmbientNoise();
       }
     } catch (err) {
-      console.error('Legacy start failed:', err);
-      alert(err?.response?.data?.error || err.message || 'Failed to start conversation');
-      isProcessingRef.current = false;
+      console.error('Realtime start failed:', err);
+      setIsConnecting(false);
       setIsProcessing(false);
+      setRealtimeState((s) => ({
+        ...s,
+        status: 'error',
+        error: err?.response?.data?.error || err?.message || 'Failed to start realtime call'
+      }));
+      isActiveRef.current = false;
+      setIsActive(false);
+      setIsListening(false);
     }
-  }, [systemPrompt, id, selectedKB, callSettings.aiSpeaksFirst, stopConversation]);
+  }, [API_BASE_URL, getAuthHeaders, id, stopConversation, systemPrompt, selectedKBs, selectedKB, callSettings.aiSpeaksFirst, startAmbientNoise]);
 
   // (Streaming/Deepgram removed)
 
@@ -531,12 +1037,120 @@ function AgentDetail() {
     isActiveRef.current = isActive;
   }, [isActive]);
 
+  // Cleanup on unmount - CRITICAL: Disconnect room when navigating away
+  useEffect(() => {
+    const cleanup = async () => {
+      // Cleanup function runs when component unmounts
+      console.log('🧹 Component unmounting - cleaning up LiveKit room...');
+      
+      // Force disconnect room
+      try {
+        if (lkRoomRef.current) {
+          console.log('🔌 Disconnecting room on unmount...');
+          await Promise.race([
+            lkRoomRef.current.disconnect(),
+            new Promise((resolve) => setTimeout(resolve, 500)) // Max 500ms wait
+          ]);
+          lkRoomRef.current = null;
+        }
+      } catch (e) {
+        console.error('Error disconnecting room on unmount:', e);
+      }
+      
+      // Stop mic track
+      try {
+        if (lkMicTrackRef.current) {
+          lkMicTrackRef.current.stop();
+          lkMicTrackRef.current = null;
+        }
+      } catch (e) {
+        // ignore
+      }
+      
+      // Clear audio container
+      if (lkAudioContainerRef.current) {
+        lkAudioContainerRef.current.innerHTML = '';
+      }
+      
+      // Reset refs
+      isActiveRef.current = false;
+      isProcessingRef.current = false;
+      lkConfigAckRef.current = false;
+      lkAgentReadyRef.current = false;
+      
+      // Stop ambient noise
+      try {
+        if (ambientAudioRef.current) {
+          ambientAudioRef.current.pause();
+          ambientAudioRef.current = null;
+        }
+      } catch (e) {
+        // ignore
+      }
+    };
+    
+    return () => {
+      cleanup();
+    };
+  }, []); // Empty deps = runs on mount/unmount only
+
+  // Also cleanup when page becomes hidden (user navigates away)
+  useEffect(() => {
+    const handleVisibilityChange = () => {
+      if (document.hidden && lkRoomRef.current) {
+        console.log('👋 Page hidden - cleaning up LiveKit room...');
+        // Stop ambient noise when page is hidden
+        try {
+          if (ambientAudioRef.current) {
+            ambientAudioRef.current.pause();
+            ambientAudioRef.current = null;
+          }
+        } catch (e) {
+          // ignore
+        }
+        stopConversation();
+      }
+    };
+    
+    const handleBeforeUnload = () => {
+      if (lkRoomRef.current) {
+        console.log('👋 Page unloading - cleaning up LiveKit room...');
+        // Force disconnect synchronously on unload
+        try {
+          lkRoomRef.current.disconnect();
+        } catch (e) {
+          // ignore
+        }
+      }
+    };
+    
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      window.removeEventListener('beforeunload', handleBeforeUnload);
+    };
+  }, [stopConversation]);
+
+
   const fetchAgent = async () => {
     try {
       const response = await axios.get(`${API_BASE_URL}/agents/${id}`);
       setAgent(response.data);
-      setSystemPrompt(response.data.systemPrompt || '');
+      const prompt = response.data.systemPrompt || '';
+      setSystemPrompt(prompt);
+      setOriginalPrompt(prompt); // Store original for change detection
+      setPromptHasChanges(false);
       setSelectedKB(response.data.knowledgeBaseId || '');
+      // Initialize selectedKBs array from knowledgeBaseIds or fallback to knowledgeBaseId
+      if (response.data.knowledgeBaseIds && Array.isArray(response.data.knowledgeBaseIds) && response.data.knowledgeBaseIds.length > 0) {
+        setSelectedKBs(response.data.knowledgeBaseIds);
+      } else if (response.data.knowledgeBaseId) {
+        setSelectedKBs([response.data.knowledgeBaseId]);
+      } else {
+        setSelectedKBs([]);
+      }
       
       // Save selected agent to localStorage
       localStorage.setItem('lastSelectedAgentId', id);
@@ -561,7 +1175,12 @@ function AgentDetail() {
         });
       }
       if (response.data.callSettings) {
-        setCallSettings(response.data.callSettings);
+        setCallSettings({
+          pauseBeforeSpeaking: response.data.callSettings.pauseBeforeSpeaking || 0,
+          aiSpeaksFirst: response.data.callSettings.aiSpeaksFirst !== undefined ? response.data.callSettings.aiSpeaksFirst : true,
+          welcomeMessageType: response.data.callSettings.welcomeMessageType || 'dynamic',
+          customWelcomeMessage: response.data.callSettings.customWelcomeMessage || ''
+        });
       }
       if (response.data.functions && response.data.functions.length > 0) {
         console.log('📋 Loaded functions from agent:', response.data.functions);
@@ -617,10 +1236,10 @@ function AgentDetail() {
       setShareableLink(`${baseUrl}/test/${response.data.shareableToken}`);
       setIsPublic(true);
       setAgent(response.data);
-      alert('Shareable link generated! You can now share this agent publicly.');
+      showToast('Shareable link generated successfully!', 'success');
     } catch (error) {
       console.error('Error generating shareable link:', error);
-      alert('Failed to generate shareable link');
+      showToast('Failed to generate shareable link. Please try again.', 'error');
     }
   };
 
@@ -647,7 +1266,7 @@ function AgentDetail() {
   const copyShareableLink = () => {
     if (shareableLink) {
       navigator.clipboard.writeText(shareableLink);
-      alert('Link copied to clipboard!');
+      showToast('Link copied to clipboard!', 'success');
     }
   };
 
@@ -659,10 +1278,10 @@ function AgentDetail() {
       setShareableLink('');
       setIsPublic(false);
       setAgent(response.data);
-      alert('Shareable link removed');
+      showToast('Shareable link removed successfully', 'success');
     } catch (error) {
       console.error('Error removing shareable link:', error);
-      alert('Failed to remove shareable link');
+      showToast('Failed to remove shareable link. Please try again.', 'error');
     }
   };
 
@@ -706,25 +1325,6 @@ function AgentDetail() {
     }
   };
 
-  const stopAudioAndResumeListening = useCallback(() => {
-    if (audioRef.current) {
-      audioRef.current.pause();
-      audioRef.current = null;
-    }
-    
-    if (isActiveRef.current && !isProcessingRef.current) {
-      setIsListening(true);
-      setTimeout(() => {
-        if (recognitionRef.current && isActiveRef.current && !isProcessingRef.current) {
-          try {
-            recognitionRef.current.start();
-          } catch (e) {
-            console.log('Recognition already running');
-          }
-        }
-      }, 200);
-    }
-  }, []);
 
   const handleUserMessage = useCallback(async (userMessage) => {
     if (!conversationId) return;
@@ -825,7 +1425,7 @@ function AgentDetail() {
               spokenTextRef.current = (spokenTextRef.current || '') + sanitizeCaptionText(evt.text);
               setAssistantDraft(spokenTextRef.current.trimStart());
             }
-            enqueueAssistantAudio(evt.audioUrl);
+            // Audio handled by LiveKit WebRTC - no need to enqueue
           }
           if (evt.type === 'latency') {
             setLatencyInfo(evt.latency || null);
@@ -883,13 +1483,6 @@ function AgentDetail() {
       // Always keep listening.
       if (isActiveRef.current) {
         setIsListening(true);
-        setTimeout(() => {
-          if (recognitionRef.current && isActiveRef.current) {
-            try {
-              recognitionRef.current.start();
-            } catch (e) {}
-          }
-        }, 100);
       }
     } catch (error) {
       // If we aborted due to barge-in, do NOT fallback (it causes double voices).
@@ -917,26 +1510,14 @@ function AgentDetail() {
           return;
         }
 
-        if (audioUrl && isActiveRef.current) {
-          enqueueAssistantAudio(audioUrl);
-        }
+        // Audio handled by LiveKit WebRTC - no need to enqueue
       } catch (fallbackErr) {
         console.error('Legacy fallback failed:', fallbackErr);
         alert('Failed to get AI response');
       }
-      // Don't use stopAudioAndResumeListening here - it might have conditions
       // Just ensure listening restarts
       if (isActiveRef.current) {
         setIsListening(true);
-        setTimeout(() => {
-          if (recognitionRef.current && isActiveRef.current) {
-            try {
-              recognitionRef.current.start();
-            } catch (e) {
-              console.log('Recognition already running');
-            }
-          }
-        }, 100);
       }
     } finally {
       // Only clear processing if this turn is still the active one
@@ -950,337 +1531,11 @@ function AgentDetail() {
       // This is critical to ensure the AI responds to subsequent messages
       if (isActiveRef.current) {
         setIsListening(true);
-        setTimeout(() => {
-          if (recognitionRef.current && isActiveRef.current) {
-            try {
-              recognitionRef.current.start();
-            } catch (e) {
-              // Recognition might already be running, that's fine
-              console.log('Recognition restart in finally - already running');
-            }
-          }
-        }, 200);
       }
     }
-  }, [conversationId, id, stopAudioAndResumeListening]);
+  }, [conversationId, id]);
 
-  // Update recognition language when speech settings change
-  useEffect(() => {
-    if (recognitionRef.current && speechSettings.language) {
-      const langCode = speechSettings.language || 'en';
-      const langMap = {
-        'en': 'en-US',
-        'es': 'es-ES',
-        'fr': 'fr-FR',
-        'de': 'de-DE',
-        'it': 'it-IT',
-        'pt': 'pt-PT',
-        'zh': 'zh-CN',
-        'ja': 'ja-JP',
-        'ko': 'ko-KR',
-        'ru': 'ru-RU',
-        'ar': 'ar-SA',
-        'hi': 'hi-IN'
-      };
-      recognitionRef.current.lang = langMap[langCode] || 'en-US';
-    }
-  }, [speechSettings.language]);
-
-  useEffect(() => {
-    if ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window) {
-      const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-      recognitionRef.current = new SpeechRecognition();
-      recognitionRef.current.continuous = true; // Keep listening continuously
-      recognitionRef.current.interimResults = true;
-      
-      // Set recognition language based on speech settings
-      const langCode = speechSettings.language || 'en';
-      const langMap = {
-        'en': 'en-US',
-        'es': 'es-ES',
-        'fr': 'fr-FR',
-        'de': 'de-DE',
-        'it': 'it-IT',
-        'pt': 'pt-PT',
-        'zh': 'zh-CN',
-        'ja': 'ja-JP',
-        'ko': 'ko-KR',
-        'ru': 'ru-RU',
-        'ar': 'ar-SA',
-        'hi': 'hi-IN'
-      };
-      recognitionRef.current.lang = langMap[langCode] || 'en-US';
-
-      recognitionRef.current.onstart = () => {
-        recognitionRunningRef.current = true;
-      };
-
-      recognitionRef.current.onresult = async (event) => {
-        let interim = '';
-        let final = '';
-
-        for (let i = event.resultIndex; i < event.results.length; i++) {
-          const transcript = event.results[i][0].transcript.trim();
-          if (event.results[i].isFinal) {
-            final += transcript + ' ';
-          } else {
-            interim += transcript;
-          }
-        }
-
-        if (interim) {
-          setInterimTranscript(interim);
-          // Start utterance timer for latency measurement
-          if (utteranceStartPerfRef.current == null) {
-            utteranceStartPerfRef.current = performance.now();
-          }
-          // Prefetch draft (text only) with debounce + cancellation
-          if (conversationId && isActiveRef.current && !isProcessingRef.current) {
-            // Do not prefetch if we're in cooldown (rate limited)
-            if (Date.now() < prefetchCooldownUntilRef.current) {
-              return;
-            }
-            // Throttle: at most once every 800ms, and only if text changes meaningfully
-            const nowMs = Date.now();
-            const lastAt = prefetchLastAtRef.current || 0;
-            const lastText = prefetchLastTextRef.current || '';
-            const newText = interim;
-            const deltaLen = Math.abs(newText.length - lastText.length);
-            if (nowMs - lastAt < 800 && deltaLen < 8) {
-              return;
-            }
-            if (prefetchDebounceTimeoutRef.current) {
-              clearTimeout(prefetchDebounceTimeoutRef.current);
-            }
-            prefetchDebounceTimeoutRef.current = setTimeout(() => {
-              // Abort previous prefetch
-              if (prefetchAbortRef.current) {
-                try {
-                  prefetchAbortRef.current.abort();
-                } catch (e) {}
-              }
-              const ac = new AbortController();
-              prefetchAbortRef.current = ac;
-              prefetchLastAtRef.current = Date.now();
-              prefetchLastTextRef.current = newText;
-              let draft = '';
-              streamNdjson({
-                url: `${API_BASE_URL}/conversation/prefetch`,
-                body: { conversationId, draftText: interim },
-                signal: ac.signal,
-                onEvent: (evt) => {
-                  if (!evt || !evt.type) return;
-                  if (evt.type === 'assistant_delta') {
-                    draft += evt.delta || '';
-                    // Keep prefetch hidden; user wants to see assistant only after they finish speaking.
-                    prefetchHiddenTextRef.current = draft;
-                  }
-                  if (evt.type === 'latency') {
-                    setLatencyInfo(evt.latency || null);
-                  }
-                  if (evt.type === 'rate_limited') {
-                    // Back off for a bit to avoid spamming OpenAI
-                    const retry = Number(evt.retryAfterMs) || 6000;
-                    prefetchCooldownUntilRef.current = Date.now() + Math.min(30000, retry + 500);
-                    try {
-                      ac.abort();
-                    } catch (e) {}
-                  }
-                }
-              }).catch(() => {
-                // ignore prefetch errors
-              });
-            }, 200);
-          }
-        }
-
-        // Barge-in: if user starts speaking while agent is speaking OR thinking,
-        // immediately stop audio + abort stream and listen to the user.
-        const isMainAudioPlaying = audioRef.current && audioRef.current.currentTime > 0;
-        const isAgentBusy = isProcessingRef.current || isMainAudioPlaying;
-        if (interim && isAgentBusy && !wasInterruptedRef.current) {
-          wasInterruptedRef.current = true;
-          // Clear any existing resume timeout
-          if (resumeTimeoutRef.current) {
-            clearTimeout(resumeTimeoutRef.current);
-            resumeTimeoutRef.current = null;
-          }
-          setPausedAudioState(null);
-          bargeInStopAgent();
-        }
-
-        // Clear resume timeout when user is speaking
-        if (interim || final) {
-          if (resumeTimeoutRef.current) {
-            clearTimeout(resumeTimeoutRef.current);
-            resumeTimeoutRef.current = null;
-          }
-        }
-
-        if (final.trim()) {
-          setInterimTranscript('');
-          // Stop speculative draft and measure ASR latency for this utterance
-          stopPrefetch();
-          const now = performance.now();
-          const start = utteranceStartPerfRef.current ?? now;
-          lastFinalClientTimingsRef.current = {
-            asr_final_ms: Math.round(now - start)
-          };
-          utteranceStartPerfRef.current = null;
-          // Clear hidden prefetch; from here we will display real assistant output
-          prefetchHiddenTextRef.current = '';
-          
-          // Clear any pending debounce timeout
-          if (messageDebounceTimeoutRef.current) {
-            clearTimeout(messageDebounceTimeoutRef.current);
-            messageDebounceTimeoutRef.current = null;
-          }
-          
-          // Debounce rapid speech results - wait 300ms to see if more speech comes
-          // This prevents processing multiple messages when user speaks in quick succession
-          const messageToProcess = final.trim();
-          pendingMessageRef.current = messageToProcess;
-          
-          messageDebounceTimeoutRef.current = setTimeout(() => {
-            const message = pendingMessageRef.current;
-            pendingMessageRef.current = null;
-            messageDebounceTimeoutRef.current = null;
-            
-            if (!message) return;
-            
-            // Clear paused audio state since we're processing a new message
-            if (resumeTimeoutRef.current) {
-              clearTimeout(resumeTimeoutRef.current);
-              resumeTimeoutRef.current = null;
-            }
-            setPausedAudioState(null);
-            wasInterruptedRef.current = false;
-            
-            // Prevent duplicate processing - only process if not already processing
-            // This prevents multiple API calls when user speaks in quick succession
-            if (!isProcessingRef.current) {
-              // Process the message
-              handleUserMessage(message);
-            } else {
-              // If already processing, ignore this message
-              console.log('⚠️ Ignoring message while processing:', message);
-            }
-          }, 300); // 300ms debounce - wait for more speech
-        }
-      };
-
-      recognitionRef.current.onerror = (event) => {
-        // 'aborted' happens a lot when stop()/start() is called quickly.
-        // Treat it as non-fatal and avoid clearing UI state.
-        if (event.error === 'aborted') {
-          recognitionRunningRef.current = false;
-          return;
-        }
-
-        if (event.error === 'no-speech') {
-          // Normal when the user pauses; keep console clean.
-          recognitionRunningRef.current = false;
-        } else {
-          console.error('Speech recognition error:', event.error);
-        }
-        recognitionRunningRef.current = false;
-        setIsListening(false);
-        setInterimTranscript('');
-        
-        if (event.error === 'no-speech') {
-          if (isActiveRef.current && !isProcessingRef.current) {
-            setTimeout(() => {
-              if (recognitionRef.current && isActiveRef.current && !isProcessingRef.current) {
-                try {
-                  safeStartRecognition();
-                } catch (e) {}
-              }
-            }, 500);
-          }
-        }
-      };
-
-      recognitionRef.current.onend = () => {
-        recognitionRunningRef.current = false;
-        // If audio was interrupted and user stopped speaking, resume it
-        if (wasInterruptedRef.current && pausedAudioState && !isProcessingRef.current) {
-          // Wait a bit to see if user starts speaking again
-          resumeTimeoutRef.current = setTimeout(() => {
-            if (wasInterruptedRef.current && pausedAudioState && !isProcessingRef.current && isActiveRef.current) {
-              wasInterruptedRef.current = false;
-              const audio = new Audio(pausedAudioState.audioUrl);
-              audioRef.current = audio;
-              audio.currentTime = pausedAudioState.currentTime;
-              
-              audio.onended = () => {
-                audioRef.current = null;
-                // Keep listening after audio ends
-                if (isActiveRef.current && !isProcessingRef.current) {
-                  setIsListening(true);
-          setTimeout(() => {
-                    if (recognitionRef.current && isActiveRef.current && !isProcessingRef.current) {
-              try {
-                safeStartRecognition();
-              } catch (e) {}
-                    }
-                  }, 100);
-                }
-              };
-
-              audio.onerror = () => {
-                audioRef.current = null;
-                if (isActiveRef.current && !isProcessingRef.current) {
-                  setIsListening(true);
-                  setTimeout(() => {
-                    if (recognitionRef.current && isActiveRef.current && !isProcessingRef.current) {
-                      try {
-                        safeStartRecognition();
-                      } catch (e) {}
-                    }
-                  }, 100);
-                }
-              };
-
-              audio.onpause = () => {
-                // Don't clear audioRef on pause
-              };
-
-              audio.play().catch(() => {
-                audioRef.current = null;
-                if (isActiveRef.current && !isProcessingRef.current) {
-                  setIsListening(true);
-                  setTimeout(() => {
-                    if (recognitionRef.current && isActiveRef.current && !isProcessingRef.current) {
-                      try {
-                        safeStartRecognition();
-                      } catch (e) {}
-                    }
-                  }, 100);
-                }
-              });
-              
-              setPausedAudioState(null);
-              resumeTimeoutRef.current = null;
-            }
-          }, 1500); // Wait 1.5 seconds after user stops speaking
-        }
-        
-        // Always restart recognition if active (even if processing, so we can capture interruptions)
-        if (isActiveRef.current) {
-          setTimeout(() => {
-            if (recognitionRef.current && isActiveRef.current) {
-              try {
-                safeStartRecognition();
-              } catch (e) {
-                // Recognition might already be running, that's okay
-                console.log('Recognition already running in onend');
-              }
-            }
-          }, 100);
-        }
-      };
-    }
-  }, [isListening, handleUserMessage, safeStartRecognition]);
+  // SpeechRecognition removed - using WebRTC only
 
   // Poll live call stats (Retell-like header)
   useEffect(() => {
@@ -1304,8 +1559,21 @@ function AgentDetail() {
     };
   }, [isActive, conversationId]);
 
+  // Toast notification system - MUST be before any early returns
+  const showToast = useCallback((message, type = 'info') => {
+    const id = Date.now() + Math.random();
+    const newToast = { id, message, type };
+    setToasts((prev) => [...prev, newToast]);
+    
+    // Auto-remove after 3 seconds
+    setTimeout(() => {
+      setToasts((prev) => prev.filter((t) => t.id !== id));
+    }, 3000);
+  }, []);
+
   const startConversation = async () => {
-    return startConversationLegacy();
+    console.log('[call] startConversation');
+    return startConversationRealtime();
   };
 
   if (!agent) {
@@ -1364,11 +1632,10 @@ function AgentDetail() {
           {/* Compact Shareable Link Section */}
           <div style={{
             display: 'flex',
-            flexDirection: 'column',
-            gap: '0.5rem',
             width: '100%',
             minWidth: '600px',
-            maxWidth: '100%'
+            maxWidth: '100%', 
+            gap: '3rem'
           }}>
             {!shareableLink ? (
               <button
@@ -1383,7 +1650,6 @@ function AgentDetail() {
                 display: 'flex',
                 gap: '0.5rem',
                 alignItems: 'center',
-                width: '100%',
                 minWidth: '600px'
               }}>
                 <input
@@ -1433,6 +1699,8 @@ function AgentDetail() {
               </div>
             )}
 
+
+
             {/* Retell-style live stats strip */}
             <div style={{
               display: 'flex',
@@ -1440,7 +1708,8 @@ function AgentDetail() {
               gap: '0.5rem',
               fontSize: '0.875rem',
               color: '#111827',
-              marginTop: '0.25rem'
+              justifyContent: 'center',
+              alignItems: 'center'
             }}>
               <span style={{ opacity: 0.75 }}>Agent ID:</span>
               <strong style={{ display: 'inline-flex', alignItems: 'center', gap: '0.35rem' }}>
@@ -1449,15 +1718,12 @@ function AgentDetail() {
                   className="btn-secondary"
                   onClick={copyAgentId}
                   title="Copy Agent ID"
-                  style={{ padding: '0.25rem 0.4rem', minWidth: 'auto', fontSize: '0.75rem' }}
+                  style={{ padding: '0.25rem 0.4rem', minWidth: 'auto', fontSize: '0.75rem', display: 'flex', alignItems: 'center', justifyContent: 'center' }}
                 >
                   Copy
                 </button>
               </strong>
 
-              <span style={{ opacity: 0.5 }}>•</span>
-              <span style={{ opacity: 0.75 }}>LLM:</span>
-              <strong>{callStats?.llmModel || speechSettings.openaiModel || '—'}</strong>
 
               <span style={{ opacity: 0.5 }}>•</span>
               <span style={{ opacity: 0.75 }}>Cost/min:</span>
@@ -1465,7 +1731,11 @@ function AgentDetail() {
 
               <span style={{ opacity: 0.5 }}>•</span>
               <span style={{ opacity: 0.75 }}>Latency:</span>
-              <strong>{fmtMs(callStats?.avgLatencyMs ?? callStats?.lastTurn?.e2eFirstAudioMs)}</strong>
+              <strong>
+                {livekitStats.rtt != null ? `RTT: ${Math.round(livekitStats.rtt)}ms` : ''}
+                {livekitStats.rtt != null && livekitStats.e2e != null ? ' | ' : ''}
+                {livekitStats.e2e != null ? `E2E: ${Math.round(livekitStats.e2e)}ms` : (callStats?.lastTurn?.e2eFirstAudioMs ? `E2E: ${Math.round(callStats.lastTurn.e2eFirstAudioMs)}ms` : callStats?.avgLatencyMs ? `E2E: ${Math.round(callStats.avgLatencyMs)}ms` : (isActive ? 'E2E: —' : '—'))}
+              </strong>
 
               <span style={{ opacity: 0.5 }}>•</span>
               <span style={{ opacity: 0.75 }}>Tokens:</span>
@@ -1474,8 +1744,32 @@ function AgentDetail() {
           </div>
         </div>
         <div className="agent-detail-actions">
-          <button className="btn-secondary" onClick={saveAgent}>
-            Save
+          <button
+            className="btn-primary"
+            onClick={async () => {
+              try {
+                await axios.put(
+                  `${API_BASE_URL}/agents/${id}`,
+                  { 
+                    systemPrompt,
+                    speechSettings,
+                    callSettings,
+                    functions,
+                    knowledgeBaseIds: selectedKBs.length > 0 ? selectedKBs : [],
+                    knowledgeBaseId: selectedKBs.length > 0 ? selectedKBs[0] : (selectedKB || null), // Use first selected KB for backward compatibility
+                    isPublic: true
+                  },
+                  { headers: getAuthHeaders() }
+                );
+                setIsPublic(true);
+                showToast('Agent published successfully!', 'success');
+              } catch (error) {
+                console.error('Failed to publish agent:', error);
+                showToast('Failed to publish agent. Please try again.', 'error');
+              }
+            }}
+          >
+            Publish
           </button>
           <button className="btn-primary" onClick={() => navigate('/')}>
             Back to Agents
@@ -1487,63 +1781,172 @@ function AgentDetail() {
         {/* Left Panel - Prompt Configuration */}
         <div className="agent-panel agent-panel-left">
           <div className="prompt-header">
-            <div className="prompt-controls">
-              <div className="control-group">
-                <label>LLM</label>
-                <div className="control-select-wrapper">
-                  <select
-                    value={speechSettings.openaiModel || 'gpt-4'}
-                    onChange={(e) => setSpeechSettings({ ...speechSettings, openaiModel: e.target.value })}
-                    className="control-select"
-                  >
-                    {OPENAI_MODELS.map(model => (
-                      <option key={model.id} value={model.id}>{model.name}</option>
-                    ))}
-                  </select>
-                </div>
+            <div className="prompt-controls-compact">
+              <div className="control-group-compact">
+                <select
+                  value={speechSettings.openaiModel || 'gpt-4o-mini'}
+                  onChange={(e) => {
+                    const newModel = e.target.value;
+                    setSpeechSettings({ ...speechSettings, openaiModel: newModel });
+                    console.log(`🔄 Model changed to: ${newModel}`);
+                    // Auto-save model change immediately
+                    if (id) {
+                      axios.put(`${API_BASE_URL}/agents/${id}`, {
+                        speechSettings: {
+                          ...speechSettings,
+                          openaiModel: newModel
+                        }
+                      }).catch(err => console.error('Error saving model:', err));
+                    }
+                  }}
+                  className="control-select-compact"
+                >
+                  {OPENAI_MODELS.map(model => (
+                    <option key={model.id} value={model.id}>{model.name}</option>
+                  ))}
+                </select>
               </div>
 
-              <div className="control-group">
-                <label>Voice</label>
-                <div className="control-select-wrapper">
-                  <button 
-                    className="control-select-btn"
-                    onClick={() => setShowVoiceModal(true)}
-                  >
-                    {speechSettings.voiceName || 'Select Voice'}
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                      <polyline points="6 9 12 15 18 9"></polyline>
-                    </svg>
-                  </button>
-                </div>
+              <div className="control-group-compact">
+                <button 
+                  className="control-select-compact-btn"
+                  onClick={() => setShowVoiceModal(true)}
+                >
+                  {speechSettings.voiceName || 'Select Voice'}
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                    <polyline points="6 9 12 15 18 9"></polyline>
+                  </svg>
+                </button>
               </div>
 
-              <div className="control-group">
-                <label>Language</label>
-                <div className="control-select-wrapper">
-                  <select
-                    value={speechSettings.language || 'en'}
-                    onChange={(e) => setSpeechSettings({ ...speechSettings, language: e.target.value })}
-                    className="control-select"
-                  >
-                    {LANGUAGES.map(lang => (
-                      <option key={lang.code} value={lang.code}>{lang.name}</option>
-                    ))}
-                  </select>
-                </div>
+              <div className="control-group-compact">
+                <select
+                  value={speechSettings.language || 'en'}
+                  onChange={(e) => setSpeechSettings({ ...speechSettings, language: e.target.value })}
+                  className="control-select-compact"
+                >
+                  {LANGUAGES.map(lang => (
+                    <option key={lang.code} value={lang.code}>{lang.name}</option>
+                  ))}
+                </select>
               </div>
             </div>
           </div>
 
           <div className="prompt-editor">
-            <div className="prompt-label">## ROLE</div>
-            <textarea
-              className="prompt-textarea"
-              value={systemPrompt}
-              onChange={(e) => setSystemPrompt(e.target.value)}
-              placeholder="You are a helpful AI agent..."
-              rows={30}
-            />
+            <div className="prompt-textarea-wrapper">
+              <textarea
+                className="prompt-textarea"
+                value={systemPrompt}
+                onChange={(e) => {
+                  setSystemPrompt(e.target.value);
+                  setPromptHasChanges(e.target.value !== originalPrompt);
+                }}
+                placeholder="You are a helpful AI agent..."
+                rows={30}
+              />
+              {promptHasChanges && (
+                <div className="prompt-buttons-overlay">
+                  <button
+                    className="btn-revert-prompt"
+                    onClick={() => {
+                      setSystemPrompt(originalPrompt);
+                      setPromptHasChanges(false);
+                    }}
+                  >
+                    Revert
+                  </button>
+                  <button
+                    className="btn-save-prompt"
+                    onClick={async () => {
+                      try {
+                        await axios.put(
+                          `${API_BASE_URL}/agents/${id}`,
+                          { systemPrompt },
+                          { headers: getAuthHeaders() }
+                        );
+                        setOriginalPrompt(systemPrompt);
+                        setPromptHasChanges(false);
+                        if (agent) {
+                          setAgent({ ...agent, systemPrompt });
+                        }
+                        showToast('Prompt saved successfully!', 'success');
+                      } catch (error) {
+                        console.error('Failed to save prompt:', error);
+                        showToast('Failed to save prompt. Please try again.', 'error');
+                      }
+                    }}
+                  >
+                    Save
+                  </button>
+                </div>
+              )}
+            </div>
+            
+            {/* Welcome Message Section */}
+            <div className="welcome-message-section">
+              <div className="welcome-message-header">
+                <h3>Welcome Message</h3>
+                <div className="pause-before-speaking">
+                  <label>Pause Before Speaking:</label>
+                  <select
+                    value={callSettings.pauseBeforeSpeaking || 0}
+                    onChange={(e) => setCallSettings({ ...callSettings, pauseBeforeSpeaking: Number(e.target.value) })}
+                    className="pause-select"
+                  >
+                    <option value="0">0s</option>
+                    <option value="0.5">0.5s</option>
+                    <option value="1">1s</option>
+                    <option value="1.5">1.5s</option>
+                    <option value="2">2s</option>
+                  </select>
+                </div>
+              </div>
+              
+              <div className="welcome-message-options">
+                {/* AI/User Speaks First Dropdown */}
+                <div className="welcome-dropdown-group">
+                  <select
+                    value={callSettings.aiSpeaksFirst ? 'ai' : 'user'}
+                    onChange={(e) => setCallSettings({ ...callSettings, aiSpeaksFirst: e.target.value === 'ai' })}
+                    className="welcome-dropdown"
+                  >
+                    <option value="ai">AI speaks first</option>
+                    <option value="user">User speaks first</option>
+                  </select>
+                </div>
+                
+                {/* Dynamic vs Custom Message Dropdown - Only show if AI speaks first */}
+                {callSettings.aiSpeaksFirst && (
+                  <>
+                    <div className="welcome-dropdown-group" style={{ marginTop: '1rem' }}>
+                      <label>Custom message</label>
+                      <select
+                        value={callSettings.welcomeMessageType || 'dynamic'}
+                        onChange={(e) => setCallSettings({ ...callSettings, welcomeMessageType: e.target.value })}
+                        className="welcome-dropdown"
+                      >
+                        <option value="dynamic">Dynamic message</option>
+                        <option value="custom">Custom message</option>
+                      </select>
+                    </div>
+                    
+                    {/* Custom Message Input */}
+                    {callSettings.welcomeMessageType === 'custom' && (
+                      <div className="custom-message-input" style={{ marginTop: '1rem' }}>
+                        <input
+                          type="text"
+                          value={callSettings.customWelcomeMessage || ''}
+                          onChange={(e) => setCallSettings({ ...callSettings, customWelcomeMessage: e.target.value })}
+                          placeholder="Enter custom welcome message..."
+                          className="custom-message-field"
+                        />
+                      </div>
+                    )}
+                  </>
+                )}
+              </div>
+            </div>
           </div>
         </div>
 
@@ -1554,28 +1957,131 @@ function AgentDetail() {
           </div>
           <div className="settings-list">
             <div className="setting-item">
-              <div className="setting-header">
-                <span>Knowledge Base</span>
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <div 
+                className="setting-header"
+                onClick={() => setExpandedSettings({ ...expandedSettings, knowledgeBase: !expandedSettings.knowledgeBase })}
+                style={{ cursor: 'pointer' }}
+              >
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                    <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
+                    <line x1="9" y1="3" x2="9" y2="21"></line>
+                    <line x1="3" y1="9" x2="21" y2="9"></line>
+                  </svg>
+                  <span>Knowledge Base</span>
+                </div>
+                <svg 
+                  width="16" 
+                  height="16" 
+                  viewBox="0 0 24 24" 
+                  fill="none" 
+                  stroke="currentColor" 
+                  strokeWidth="2"
+                  style={{ transform: expandedSettings.knowledgeBase ? 'rotate(180deg)' : 'rotate(0deg)', transition: 'transform 0.2s' }}
+                >
                   <polyline points="6 9 12 15 18 9"></polyline>
                 </svg>
               </div>
-              <div className="setting-content">
-                <label>Connect Knowledge Base</label>
-                <select 
-                  value={selectedKB} 
-                  onChange={(e) => setSelectedKB(e.target.value)}
-                  className="kb-select"
-                >
-                  <option value="">None</option>
-                  {knowledgeBases.map(kb => (
-                    <option key={kb.id} value={kb.id}>{kb.name}</option>
-                  ))}
-                </select>
-                {selectedKB && (
-                  <p className="kb-connected">Knowledge base connected</p>
-                )}
-              </div>
+              {expandedSettings.knowledgeBase && (
+                <div className="setting-content">
+                  <p style={{ fontSize: '0.875rem', color: '#6b7280', marginBottom: '1rem' }}>
+                    Add knowledge base to provide context to the agent.
+                  </p>
+                  
+                  {/* List of Selected Knowledge Bases */}
+                  <div className="kb-list">
+                    {selectedKBs.map(kbId => {
+                      const kb = knowledgeBases.find(k => (k._id || k.id) === kbId);
+                      if (!kb) return null;
+                      return (
+                        <div 
+                          key={kbId} 
+                          className="kb-item kb-item-selected"
+                        >
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flex: 1 }}>
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                              <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
+                              <line x1="9" y1="3" x2="9" y2="21"></line>
+                              <line x1="3" y1="9" x2="21" y2="9"></line>
+                            </svg>
+                            <span>{kb.name}</span>
+                          </div>
+                          <button
+                            className="kb-delete-btn"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setSelectedKBs(selectedKBs.filter(id => id !== kbId));
+                              // Also update selectedKB for backward compatibility
+                              if (selectedKB === kbId) {
+                                setSelectedKB(selectedKBs.length > 1 ? selectedKBs.find(id => id !== kbId) : '');
+                              }
+                            }}
+                            title="Remove knowledge base"
+                          >
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                              <path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+                            </svg>
+                          </button>
+                        </div>
+                      );
+                    })}
+                    {selectedKBs.length === 0 && (
+                      <p style={{ fontSize: '0.875rem', color: '#9ca3af', fontStyle: 'italic', padding: '0.5rem' }}>
+                        No knowledge bases added
+                      </p>
+                    )}
+                  </div>
+                  
+                  {/* Add Button with Dropdown */}
+                  <div className="kb-add-wrapper" style={{ position: 'relative' }}>
+                    <button 
+                      className="kb-add-btn"
+                      onClick={() => {
+                        setShowKBAddDropdown(!showKBAddDropdown);
+                      }}
+                    >
+                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                        <line x1="12" y1="5" x2="12" y2="19"></line>
+                        <line x1="5" y1="12" x2="19" y2="12"></line>
+                      </svg>
+                      Add
+                    </button>
+                    {showKBAddDropdown && (
+                      <div className="kb-add-dropdown">
+                        {knowledgeBases
+                          .filter(kb => !selectedKBs.includes(kb._id || kb.id))
+                          .map(kb => (
+                            <div
+                              key={kb._id || kb.id}
+                              className="kb-dropdown-item"
+                              onClick={() => {
+                                const kbId = kb._id || kb.id;
+                                setSelectedKBs([...selectedKBs, kbId]);
+                                // Also update selectedKB for backward compatibility (use first one)
+                                if (selectedKBs.length === 0) {
+                                  setSelectedKB(kbId);
+                                }
+                                setShowKBAddDropdown(false);
+                              }}
+                            >
+                              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
+                                <line x1="9" y1="3" x2="9" y2="21"></line>
+                                <line x1="3" y1="9" x2="21" y2="9"></line>
+                              </svg>
+                              <span>{kb.name}</span>
+                            </div>
+                          ))}
+                        {knowledgeBases.filter(kb => !selectedKBs.includes(kb._id || kb.id)).length === 0 && (
+                          <div className="kb-dropdown-item" style={{ color: '#9ca3af', fontStyle: 'italic' }}>
+                            No more knowledge bases available
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
             </div>
 
             <div className="setting-item">
@@ -1801,30 +2307,46 @@ function AgentDetail() {
                 <button 
                   className="btn-primary btn-test"
                   onClick={startConversation}
-                  disabled={isProcessing || !systemPrompt.trim()}
+                  disabled={isProcessing || isConnecting || isStopping || !systemPrompt.trim()}
+                  style={{ 
+                    opacity: (isProcessing || isConnecting || isStopping || !systemPrompt.trim()) ? 0.6 : 1,
+                    cursor: (isProcessing || isConnecting || isStopping || !systemPrompt.trim()) ? 'not-allowed' : 'pointer'
+                  }}
                 >
-                  {isProcessing ? 'Starting...' : 'Test'}
+                  {isConnecting ? (
+                    <>
+                      <span className="spinner" style={{ display: 'inline-block', marginRight: '8px', animation: 'spin 1s linear infinite' }}>⟳</span>
+                      Connecting...
+                    </>
+                  ) : isProcessing ? 'Starting...' : 'Test'}
                 </button>
               </div>
             ) : (
               <div className="test-active">
-                <div className="test-controls-top">
-                  <button 
-                    className="btn-secondary btn-small"
-                    onClick={stopConversation}
-                  >
-                    Stop
-                  </button>
-                </div>
-
                 <div className="test-conversation">
+                  {/* Hidden-ish container for LiveKit audio track attachments.
+                      Avoid `display:none` because some browsers won't autoplay hidden media. */}
+                  <div
+                    ref={lkAudioContainerRef}
+                    style={{
+                      position: 'absolute',
+                      width: '1px',
+                      height: '1px',
+                      overflow: 'hidden',
+                      clip: 'rect(0 0 0 0)',
+                      clipPath: 'inset(50%)',
+                      whiteSpace: 'nowrap'
+                    }}
+                  />
+
                   <div className="messages-container">
-                    <AnimatePresence>
-                      {messages.map((message, index) => (
+                    <AnimatePresence mode="popLayout">
+                      {messages.map((message) => (
                         <motion.div
-                          key={index}
+                          key={message.id || `msg_${message.role}_${message.content.substring(0, 20)}`}
                           initial={{ opacity: 0, y: 10 }}
                           animate={{ opacity: 1, y: 0 }}
+                          exit={{ opacity: 0, y: -10 }}
                           className={`message ${message.role}`}
                         >
                           <div className="message-content">
@@ -1832,40 +2354,38 @@ function AgentDetail() {
                           </div>
                         </motion.div>
                       ))}
+                      
+                      {/* Show assistant draft (sentence-by-sentence) - appears AFTER all messages as TTS speaks */}
+                      {assistantDraft && (
+                        <motion.div
+                          key="assistant-draft"
+                          initial={{ opacity: 0 }}
+                          animate={{ opacity: 1 }}
+                          exit={{ opacity: 0 }}
+                          className="message assistant draft"
+                        >
+                          <div className="message-content">
+                            {assistantDraft}
+                          </div>
+                        </motion.div>
+                      )}
+
+                      {/* Show user interim transcript - appears AFTER all messages and assistant draft */}
+                      {interimTranscript && (
+                        <motion.div
+                          key="user-interim"
+                          initial={{ opacity: 0 }}
+                          animate={{ opacity: 1 }}
+                          exit={{ opacity: 0 }}
+                          className="message user interim"
+                        >
+                          <div className="message-content">
+                            {interimTranscript}
+                            <span className="typing-cursor">|</span>
+                          </div>
+                        </motion.div>
+                      )}
                     </AnimatePresence>
-
-                    {/* Show assistant text only after user finished speaking (no interim visible) */}
-                    {assistantDraft && !interimTranscript && (
-                      <motion.div
-                        initial={{ opacity: 0 }}
-                        animate={{ opacity: 1 }}
-                        className="message assistant draft"
-                      >
-                        <div className="message-content">
-                          {assistantDraft}
-                          <span className="typing-cursor">|</span>
-                          {latencyInfo?.llmFirstTokenMs != null && (
-                            <div style={{ fontSize: '12px', opacity: 0.7, marginTop: '6px' }}>
-                              LLM first token: {latencyInfo.llmFirstTokenMs}ms
-                              {latencyInfo.ttsFirstAudioMs != null ? ` • TTS first audio: ${latencyInfo.ttsFirstAudioMs}ms` : ''}
-                            </div>
-                          )}
-                        </div>
-                      </motion.div>
-                    )}
-
-                    {interimTranscript && (
-                      <motion.div
-                        initial={{ opacity: 0 }}
-                        animate={{ opacity: 1 }}
-                        className="message user interim"
-                      >
-                        <div className="message-content">
-                          {interimTranscript}
-                          <span className="typing-cursor">|</span>
-                        </div>
-                      </motion.div>
-                    )}
 
                     {isProcessing && (
                       <motion.div
@@ -1882,23 +2402,52 @@ function AgentDetail() {
                     )}
                   </div>
 
-                  <div className="listening-indicator">
-                    {isActive && !isProcessing ? (
-                      <div className="listening-pulse">
-                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                          <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path>
-                          <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
-                        </svg>
-                        Listening...
-                      </div>
-                    ) : (
-                      <div className="listening-pulse inactive">
-                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                          <line x1="1" y1="1" x2="23" y2="23"></line>
-                        </svg>
-                        {isProcessing ? 'Processing...' : 'Not listening'}
-                      </div>
-                    )}
+                  <div className="listening-indicator" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '1rem' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                      {isActive && !isProcessing ? (
+                        <div className="listening-pulse">
+                          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                            <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path>
+                            <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
+                          </svg>
+                          Mic live...
+                        </div>
+                      ) : (
+                        <div className="listening-pulse inactive">
+                          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                            <line x1="1" y1="1" x2="23" y2="23"></line>
+                          </svg>
+                          {isProcessing ? 'Processing...' : 'Not listening'}
+                        </div>
+                      )}
+                    </div>
+                    <button 
+                      className="btn-secondary btn-small"
+                      onClick={stopConversation}
+                      disabled={isStopping || isConnecting}
+                      style={{ 
+                        opacity: (isStopping || isConnecting) ? 0.6 : 1,
+                        cursor: (isStopping || isConnecting) ? 'not-allowed' : 'pointer',
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '0.5rem'
+                      }}
+                    >
+                      {isStopping ? (
+                        <>
+                          <span className="spinner" style={{ 
+                            display: 'inline-block', 
+                            width: '14px', 
+                            height: '14px', 
+                            border: '2px solid currentColor',
+                            borderTopColor: 'transparent',
+                            borderRadius: '50%',
+                            animation: 'spin 0.6s linear infinite'
+                          }}></span>
+                          Stopping...
+                        </>
+                      ) : 'Stop'}
+                    </button>
                   </div>
                 </div>
               </div>
@@ -1919,6 +2468,38 @@ function AgentDetail() {
         }}
         currentSettings={speechSettings}
       />
+
+      {/* Toast Notifications */}
+      <div className="toast-container">
+        <AnimatePresence>
+          {toasts.map((toast) => (
+            <motion.div
+              key={toast.id}
+              initial={{ opacity: 0, y: 50, x: 0 }}
+              animate={{ opacity: 1, y: 0, x: 0 }}
+              exit={{ opacity: 0, x: 100 }}
+              className={`toast toast-${toast.type}`}
+            >
+              {toast.message}
+            </motion.div>
+          ))}
+        </AnimatePresence>
+      </div>
+      
+      {/* Click outside handler for KB dropdown */}
+      {showKBAddDropdown && (
+        <div
+          style={{
+            position: 'fixed',
+            top: 0,
+            left: 0,
+            right: 0,
+            bottom: 0,
+            zIndex: 99
+          }}
+          onClick={() => setShowKBAddDropdown(false)}
+        />
+      )}
     </div>
   );
 }

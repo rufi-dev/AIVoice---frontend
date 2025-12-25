@@ -230,6 +230,18 @@ function CallHistory() {
                     <span className="detail-label">Duration:</span>
                     <span>{formatDate(selectedCall.startTime)} - {formatDate(selectedCall.endTime) || 'Ongoing'}</span>
                   </div>
+                  {selectedCall.roomName && (
+                    <div className="detail-meta-item">
+                      <span className="detail-label">Room:</span>
+                      <span className="call-id-text">{selectedCall.roomName}</span>
+                    </div>
+                  )}
+                  {selectedCall.provider && (
+                    <div className="detail-meta-item">
+                      <span className="detail-label">Provider:</span>
+                      <span>{selectedCall.provider}</span>
+                    </div>
+                  )}
                   <div className="detail-meta-item">
                     <span className="detail-label">Cost:</span>
                     <span>${selectedCall.cost.toFixed(3)}</span>
@@ -266,6 +278,14 @@ function CallHistory() {
                       <span>{formatMs(selectedCall.latencySummary?.avgE2eFirstAudioMs)}</span>
                     </div>
                   </div>
+                  {selectedCall.metrics?.avgVadEndToPlayoutStartMs != null && (
+                    <div className="analysis-item">
+                      <span className="analysis-label">Avg Latency (VAD→Playout)</span>
+                      <div className="analysis-value">
+                        <span>{formatMs(selectedCall.metrics.avgVadEndToPlayoutStartMs)}</span>
+                      </div>
+                    </div>
+                  )}
                   <div className="analysis-item">
                     <span className="analysis-label">Last Turn Latency</span>
                     <div className="analysis-value">
@@ -290,6 +310,21 @@ function CallHistory() {
                     >
                       Your browser does not support the audio element.
                     </audio>
+                  </div>
+                </div>
+              )}
+
+              {selectedCall.recordingUrl && (
+                <div className="detail-section">
+                  <h3 className="detail-section-title">Call Recording (LiveKit)</h3>
+                  <div className="audio-player-container">
+                    {String(selectedCall.recordingUrl).startsWith('http') ? (
+                      <audio controls src={selectedCall.recordingUrl} style={{ width: '100%' }} />
+                    ) : (
+                      <div style={{ fontSize: '12px', opacity: 0.85, wordBreak: 'break-all' }}>
+                        {selectedCall.recordingUrl}
+                      </div>
+                    )}
                   </div>
                 </div>
               )}

@@ -48,9 +48,10 @@ function AppRoutes() {
   const { isAuthenticated } = useAuth();
   const location = useLocation();
   
-  // Hide sidebar for public test routes
+  // Hide sidebar for public test routes and agent detail page
   const isPublicRoute = location.pathname.startsWith('/test/');
-  const showSidebar = isAuthenticated && !isPublicRoute;
+  const isAgentDetailPage = location.pathname.startsWith('/agent/');
+  const showSidebar = isAuthenticated && !isPublicRoute && !isAgentDetailPage;
 
   return (
     <>
